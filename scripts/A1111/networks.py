@@ -18,7 +18,18 @@ import scripts.A1111.network_oft as network_oft
 import torch
 from typing import Union
 
-from modules import shared, devices, sd_models, errors, scripts, sd_hijack, launch_utils
+from modules import shared, devices, sd_models, errors, scripts, launch_utils
+
+try:
+    from modules import sd_hijack
+except ImportError:
+    class _NoopModelHijack:
+        comments = []
+
+    class _NoopSdHijack:
+        model_hijack = _NoopModelHijack()
+
+    sd_hijack = _NoopSdHijack()
 import modules.textual_inversion.textual_inversion as textual_inversion
 
 class QkvLinear(torch.nn.Linear):
@@ -35,7 +46,7 @@ module_types = [
     network_oft.ModuleTypeOFT(),
 ]
 
-forge = launch_utils.git_tag()[0:2] == "f2"
+forge = launch_utils.git_tag()[0:2] == "f2" or launch_utils.git_tag() == "neo"
 
 re_digits = re.compile(r"\d+")
 re_x_proj = re.compile(r"(.*)_([qkv]_proj)$")

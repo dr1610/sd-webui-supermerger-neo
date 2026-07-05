@@ -2,7 +2,24 @@ import os
 import torch
 import safetensors.torch
 import threading
-from modules import shared, sd_hijack, sd_models
+from modules import shared, sd_models
+
+try:
+    from modules import sd_hijack
+except ImportError:
+    class _NoopModelHijack:
+        comments = []
+
+        def undo_hijack(self, *_args, **_kwargs):
+            return None
+
+        def hijack(self, *_args, **_kwargs):
+            return None
+
+    class _NoopSdHijack:
+        model_hijack = _NoopModelHijack()
+
+    sd_hijack = _NoopSdHijack()
 import json
 
 try:

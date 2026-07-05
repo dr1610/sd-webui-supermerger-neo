@@ -966,7 +966,7 @@ def on_ui_tabs():
         
         image_input.upload(fn=process_images, inputs=image_input, outputs=[output_textbox,image_input])
 
-    return (supermergerui, "SuperMerger", "supermerger"),
+    return (supermergerui, "SuperMerger Neo", "supermerger_neo"),
 
 msearch = []
 mlist=[]

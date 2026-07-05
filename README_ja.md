@@ -1,3 +1,18 @@
+# sd-webui-supermerger-neo
+
+[hako-mikan/sd-webui-supermerger](https://github.com/hako-mikan/sd-webui-supermerger) を Stable Diffusion WebUI Forge - Neo 向けに調整した派生版です。
+
+元リポジトリの AGPL-3.0 ライセンスと hako-mikan 様の著作権表記を維持しています。
+この派生版では、Forge - Neo で読み込み・利用できるようにするための互換修正を中心に追加しています。
+
+## Neo対応の主な変更
+
+- `modules.generation_parameters_copypaste` がない環境では `modules.infotext_utils` を使用。
+- Neoに存在しない `sd_hijack` 用の最小互換フォールバックを追加。
+- LoRA/network処理でNeoをForge系バックエンドとして扱うように調整。
+- WebUI上のタブ名を `SuperMerger Neo` に変更。
+
+---
 # SuperMerger
 - [AUTOMATIC1111's stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) 用のモデルマージ拡張
 - マージしたモデルを保存せず直接生成に使用できます

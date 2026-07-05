@@ -1,3 +1,18 @@
+# sd-webui-supermerger-neo
+
+Neo-compatible fork/adaptation of [hako-mikan/sd-webui-supermerger](https://github.com/hako-mikan/sd-webui-supermerger).
+
+This repository keeps the original AGPL-3.0 license and copyright notice from hako-mikan's SuperMerger.
+The changes here are focused on making SuperMerger load and run in Stable Diffusion WebUI Forge - Neo.
+
+## Neo compatibility changes
+
+- Use `modules.infotext_utils` when `modules.generation_parameters_copypaste` is not available.
+- Add a small `sd_hijack` compatibility fallback for Neo.
+- Treat Neo as a Forge-like backend in SuperMerger LoRA/network handling.
+- Rename the WebUI tab to `SuperMerger Neo`.
+
+---
 # SuperMerger
 - Model merge extention for [AUTOMATIC1111's stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) 
 - Merge models can be loaded directly for generation without saving

@@ -24,7 +24,7 @@ from scripts.mergers.model_util import filenamecutter, savemodel
 from scripts.mergers.mergers import extract_super, unload_forge, q_dequantize, q_quantize, qdtyper, prefixer, BLOCKIDFLUX
 from tqdm import tqdm
 
-forge = launch_utils.git_tag()[0:2] == "f2"
+forge = launch_utils.git_tag()[0:2] == "f2" or launch_utils.git_tag() == "neo"
 
 selectable = []
 pchanged = False
