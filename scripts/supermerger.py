@@ -48,6 +48,15 @@ except:
     forge = False
 
 from typing import Union
+
+MAX_UI_LORA_CHOICES = 20000
+
+def limited_lora_choices(lora_module):
+    names = sorted(lora_module.available_loras.keys(), key=str.casefold)
+    if len(names) > MAX_UI_LORA_CHOICES:
+        print(f"SuperMerger Neo: LoRA list has {len(names)} entries; showing first {MAX_UI_LORA_CHOICES} in UI.")
+    return names[:MAX_UI_LORA_CHOICES]
+
 def network_reset_cached_weight(self: Union[torch.nn.Conv2d, torch.nn.Linear]):
     self.network_current_names = ()
     self.network_weights_backup = None
@@ -479,8 +488,8 @@ def on_ui_tabs():
                     create_refresh_button(smd_model_a, sd_models.list_models,lambda: {"choices": sd_models.checkpoint_tiles()},"refresh_checkpoint_Z")    
                     smd_loadkeys = gr.Button(value="load keys",variant='primary')
                 with gr.Row():
-                    smd_lora = gr.Dropdown(list(lora.available_loras.keys()),elem_id="model_converter_model_name",label="LoRA",interactive=True)
-                    create_refresh_button(smd_lora, lora.list_available_loras, lambda: {"choices": list(lora.available_loras.keys())},"refresh_checkpoint_Z")
+                    smd_lora = gr.Dropdown(limited_lora_choices(lora),elem_id="model_converter_model_name",label="LoRA",interactive=True)
+                    create_refresh_button(smd_lora, lora.list_available_loras, lambda: {"choices": limited_lora_choices(lora)},"refresh_checkpoint_Z")
                     smd_loadkeys_l = gr.Button(value="load keys",variant='primary')
                 with gr.Row():
                     keys = gr.Dataframe(headers=["No.","block","key"],)

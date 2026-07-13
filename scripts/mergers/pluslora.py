@@ -28,6 +28,28 @@ forge = launch_utils.git_tag()[0:2] == "f2" or launch_utils.git_tag() == "neo"
 
 selectable = []
 pchanged = False
+MAX_UI_LORA_CHOICES = 500
+
+def lora_matches_query(name, lora_on_disk, query):
+    terms = [term.lower() for term in str(query or "").split() if term.strip()]
+    if not terms:
+        return True
+    filename = getattr(lora_on_disk, "filename", "") if lora_on_disk is not None else ""
+    haystack = f"{name} {filename}".lower().replace("\\", "/")
+    return all(term in haystack for term in terms)
+
+def limited_lora_choices(lora_module, query=""):
+    matches = []
+    total = 0
+    for name, lora_on_disk in lora_module.available_loras.items():
+        total += 1
+        if lora_matches_query(name, lora_on_disk, query):
+            matches.append(name)
+        if len(matches) >= MAX_UI_LORA_CHOICES:
+            break
+    if total > MAX_UI_LORA_CHOICES or query:
+        print(f"SuperMerger Neo: showing {len(matches)} LoRA choices (limit {MAX_UI_LORA_CHOICES}, query='{query or ''}').")
+    return matches
 
 CUDA = torch.device("cuda:0")
 CPU = torch.device("cpu")
@@ -62,7 +84,7 @@ def f_changediffusers(version):
 def on_ui_tabs():
     import lora
     global selectable
-    selectable= [x[0] for x in lora.available_loras.items()]
+    selectable = limited_lora_choices(lora)
     sml_path_root = scripts.basedir()
     LWEIGHTSPRESETS="\
     NONE:0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n\
@@ -77,7 +99,7 @@ def on_ui_tabs():
     ALL0.5:0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5"
     lbwpath = os.path.join(sml_path_root,"scripts", "lbwpresets.txt")
     lbwpathn = os.path.join(sml_path_root,"extensions","sd-webui-lora-block-weight","scripts", "lbwpresets.txt")
-    dimpath = os.path.join(sml_path_root,"extensions","sd-webui-supermerger","loradims.csv")
+    dimpath = os.path.join(sml_path_root,"extensions","sd-webui-supermerger-neo","loradims.csv")
     sml_lbwpresets=""
 
     if os.path.isfile(lbwpath):
@@ -96,7 +118,7 @@ def on_ui_tabs():
         d_ver = None
 
     with gr.Blocks(analytics_enabled=False) :
-        sml_submit_result = gr.Textbox(label="Message")
+        sml_submit_result = gr.Textbox(label="Message", value="")
         with gr.Row(equal_height=False):
             with gr.Column():
                 sml_cpmerge = gr.Button(elem_id="model_merger_merge", value="Merge to Checkpoint(Model A)",variant='primary')
@@ -140,11 +162,20 @@ def on_ui_tabs():
             sml_deselectall = gr.Button(elem_id="slm_deselectall", value="deselect all",variant='primary')
             components.frompromptb = gr.Button(elem_id="slm_deselectall", value="get from prompt",variant='primary')
             hidenb = gr.Checkbox(value = False,visible = False)
+        with gr.Row():
+            sml_lora_search = gr.Textbox(label="LoRA search", placeholder="name/path terms, space = AND", lines=1)
+            sml_lora_search_btn = gr.Button(value="search LoRA", variant='primary')
+            sml_lora_clear_btn = gr.Button(value="clear")
         sml_loras = gr.CheckboxGroup(label = "LoRAs on disk",choices = selectable,type="value",interactive=True,visible = True)
-        sml_loraratios = gr.TextArea(label="",value=sml_lbwpresets,visible =True,interactive  = True)  
+        sml_loraratios = gr.TextArea(label="",value="",visible =True,interactive  = True)
+        with gr.Row():
+            sml_load_lbw_presets = gr.Button(value="load block weight presets")
+            sml_clear_lbw_presets = gr.Button(value="clear block weight presets")
 
         sml_selectall.click(fn = lambda x:gr.update(value = selectable),outputs = [sml_loras])
         sml_deselectall.click(fn = lambda x:gr.update(value =[]),outputs = [sml_loras])
+        sml_load_lbw_presets.click(fn=lambda: sml_lbwpresets, outputs=[sml_loraratios])
+        sml_clear_lbw_presets.click(fn=lambda: "", outputs=[sml_loraratios])
 
         with gr.Row():
             changediffusers = gr.Button(elem_id=f"change_diffusers_version", value=f"change diffusers version(now:{d_ver})",variant='primary')
@@ -194,21 +225,61 @@ def on_ui_tabs():
                 out.append(f"{name}[{','.join(add)}]" if add != ["","",""] else f"{name}")
             return out
 
-        def updateloras():
-            lora.list_available_loras()
-            names = []
-            for n in  lora.available_loras.items():
-                if n[0] not in ldict:ldict[n[0]] = ["","",""]
-                names.append(n[0])
+        def limited_lora_dict(source):
+            out = {}
+            for name, vals in source.items():
+                out[name] = vals
+                if len(out) >= MAX_UI_LORA_CHOICES:
+                    break
+            return out
 
-            for l in list(ldict.keys()):
-                if l not in names:ldict.pop(l)
+        def normalize_lora_choice(name):
+            name = str(name or "")
+            return name[:name.find("[")] if "[" in name else name
+
+        def updateloras(query="", selected=None):
+            lora.list_available_loras()
+            query = str(query or "").strip()
+            selected_names = []
+            for item in selected or []:
+                name = normalize_lora_choice(item)
+                if name and name in lora.available_loras and name not in selected_names:
+                    selected_names.append(name)
+                    if name not in ldict:ldict[name] = ["","",""]
+
+            names = []
+            matched = 0
+            total = len(lora.available_loras)
+            for name, lora_on_disk in lora.available_loras.items():
+                if not lora_matches_query(name, lora_on_disk, query):
+                    continue
+                matched += 1
+                if len(names) < MAX_UI_LORA_CHOICES:
+                    if name not in ldict:ldict[name] = ["","",""]
+                    names.append(name)
 
             global selectable
-            selectable = toselect(ldict)
-            return gr.update(choices = selectable)
+            visible_names = selected_names + [name for name in names if name not in selected_names]
+            visible = {name: ldict[name] for name in visible_names if name in ldict}
+            selectable = toselect(visible)
+            selected_values = toselect({name: ldict[name] for name in selected_names if name in ldict})
+            if query:
+                message = f"LoRA search: showing {len(names)} of {matched} matches for '{query}' (total {total}, limit {MAX_UI_LORA_CHOICES}, selected {len(selected_names)} kept)."
+            else:
+                message = f"LoRA list: showing first {len(names)} of {total} LoRAs. Use LoRA search to find items beyond the first {MAX_UI_LORA_CHOICES}. Selected {len(selected_names)} kept."
+            return gr.update(choices = selectable, value=selected_values), message
 
-        sml_update.click(fn = updateloras,outputs = [sml_loras])
+        def search_loras(query, selected):
+            return updateloras(query, selected)
+
+        def clear_lora_search(selected):
+            choices, message = updateloras("", selected)
+            return "", choices, message
+
+        sml_update.click(fn = updateloras, inputs=[sml_lora_search, sml_loras], outputs = [sml_loras, sml_submit_result])
+        sml_lora_search_btn.click(fn=search_loras, inputs=[sml_lora_search, sml_loras], outputs=[sml_loras, sml_submit_result])
+        sml_lora_search.submit(fn=search_loras, inputs=[sml_lora_search, sml_loras], outputs=[sml_loras, sml_submit_result])
+        sml_lora_clear_btn.click(fn=clear_lora_search, inputs=[sml_loras], outputs=[sml_lora_search, sml_loras, sml_submit_result])
 
         def makedimlist(ver):
             outs = []
@@ -225,7 +296,7 @@ def on_ui_tabs():
             return outs + outs_list
 
         def calculatedim(calcsets, device):
-            # CSVから読み込む
+            # Load cached LoRA dimensions from CSV.
             if "Load from CSV" in calcsets:
                 with open(dimpath, mode='r', encoding='utf-8') as csv_file:
                     csv_reader = csv.reader(csv_file)
@@ -246,7 +317,7 @@ def on_ui_tabs():
                     
                 ldict[name] = [d,t,s]
 
-            # CSVに保存
+            # Save cached LoRA dimensions to CSV.
             if "Save as CSV" in calcsets:
                 with open(dimpath, mode='w', encoding='utf-8', newline='') as csv_file:
                     csv_writer = csv.writer(csv_file)
@@ -254,7 +325,7 @@ def on_ui_tabs():
                         csv_writer.writerow([key, *value])
 
             global selectable
-            selectable = toselect(ldict)
+            selectable = toselect(limited_lora_dict(ldict))
             return (gr.update(choices=selectable, value=[]), 
                     gr.update(visible=True, choices=makedimlist("1.X/2.X")),
                     gr.update(visible=True, choices=makedimlist("XL")),
@@ -280,7 +351,7 @@ def on_ui_tabs():
                     rl[name] = vals
 
             global selectable
-            selectable = toselect(rl)
+            selectable = toselect(limited_lora_dict(rl))
 
             return gr.update(choices = selectable, value =[])
 
@@ -313,9 +384,13 @@ def makelora(model_a,model_b,dim,saveto,settings,alpha,beta,save_precision,calc_
     except:
         currentinfo = None
 
-    lowvramdealer() #web-uiのバグ対策
+    lowvramdealer() # Work around web UI low VRAM state issues.
 
-    checkpoint_info = sd_models.get_closet_checkpoint_match(model_a)
+    checkpoint_info = resolve_checkpoint_info(model_a)
+    if checkpoint_info is None:
+        return f"ERROR: Model not found: {model_a}"
+    if resolve_checkpoint_info(model_b) is None:
+        return f"ERROR: Model not found: {model_b}"
     load_model(checkpoint_info)
 
     model = shared.sd_model
@@ -399,7 +474,7 @@ def lmerge(loranames,loraratioss,settings,filename,dim,save_precision,calc_preci
             if ":" not in l or not any(l.count(",") == x - 1 for x in BLOCKNUMS) : continue
             ldict[l.split(":")[0]]=l.split(":")[1]
 
-        ln, lr, ld, lt, lm, ls = [], [], [], [], [], [] #lm: 各LoRAのマージ用メタデータ #ls: SD-?
+        ln, lr, ld, lt, lm, ls = [], [], [], [], [], [] # lm: metadata for each LoRA, ls: SD version
         dmax = 1
 
         for i,n in enumerate(lnames):
@@ -429,7 +504,7 @@ def lmerge(loranames,loraratioss,settings,filename,dim,save_precision,calc_preci
             if d != "LyCORIS" and isinstance(d, int):
                 if d > dmax : dmax = d
             
-            # LoRA毎のメタデータを保存
+            # Keep metadata for each LoRA.
             meta = prepare_merge_metadata( n[1], ",".join( [str(n) for n in ratio] ), c_lora )
             lm.append( meta )
 
@@ -465,7 +540,7 @@ def lmerge(loranames,loraratioss,settings,filename,dim,save_precision,calc_preci
             b = merge_lora_models(ln[1:2], lr[1:2], settings, False, calc_precision, device)
             sd = extract_two(a,b,alpha,beta,smooth)
         
-        # マージ後のメタデータを取得
+        # Build metadata for the merged LoRA.
         metadata = create_merge_metadata( sd, lm, loraname, save_precision,metasets )
 
         save_to_file(filename,sd,sd, str_to_dtype(save_precision), metadata)
@@ -525,7 +600,7 @@ def merge_lora_models(models, ratios, sets, locon, calc_precision, device):
             if key in merged_sd:
                 assert merged_sd[key].size() == lora_sd[key].size(), (
                     f"weights shape mismatch merging v1 and v2, different dims? "
-                    f"/ 重みのサイズが合いません。v1とv2、または次元数の異なるモデルはマージできません"
+                    f"/ weights shape mismatch; v1/v2 or different dimensions cannot be merged"
                     f" {merged_sd[key].size()} ,{lora_sd[key].size()}, {lora_module_name}"
                 )
                 merged_sd[key] = merged_sd[key] + lora_sd[key] * scale
@@ -832,16 +907,18 @@ def pluslora(lnames,loraratios,settings,output,model,save_precision,calc_precisi
             elif "model_" in skey:
                 keychanger[skey.split("model_",1)[1]] = key
 
-    lowvramdealer() #web-uiのバグ対策
+    lowvramdealer() # Work around web UI low VRAM state issues.
 
     if is15:
         if shared.sd_model is not None:
             orig_checkpoint = shared.sd_model.sd_checkpoint_info if hasattr(shared.sd_model, "sd_checkpoint_info") else None
         else:
             orig_checkpoint = None
-        checkpoint_info = sd_models.get_closet_checkpoint_match(model)
+        checkpoint_info = resolve_checkpoint_info(model)
+        if checkpoint_info is None:
+            return f"ERROR: Model not found: {model}"
         if orig_checkpoint != checkpoint_info:
-            sd_models.reload_model_weights(info=checkpoint_info)
+            load_model(checkpoint_info)
         
         theta_0 = newpluslora(theta_0,filenames,lweis,names, calc_precision, isxl,isv2,isflux, keychanger)
         
@@ -860,7 +937,7 @@ def pluslora(lnames,loraratios,settings,output,model,save_precision,calc_precisi
             prefixer(theta_0, True)
 
         if orig_checkpoint:
-            sd_models.reload_model_weights(info=orig_checkpoint)
+            load_model(orig_checkpoint)
     else:
         theta_0 = oldpluslora(theta_0,filenames,lweis,names, calc_precision,isxl,isv2, keychanger, device)
 
@@ -869,8 +946,10 @@ def pluslora(lnames,loraratios,settings,output,model,save_precision,calc_precisi
     settings.append("safetensors")
     result = savemodel(theta_0,dname,output,settings)
 
-    lora.loaded_loras.clear()
-    sd_models.checkpoints_loaded.clear()
+    if hasattr(lora, "loaded_loras"):
+        lora.loaded_loras.clear()
+    if hasattr(sd_models, "checkpoints_loaded"):
+        sd_models.checkpoints_loaded.clear()
     if forge:
         from modules.sd_models import FakeInitialModel
         sd_models.unload_model_weights()
@@ -992,9 +1071,9 @@ def newpluslora(theta_0,filenames,lweis,names, calc_precision,isxl,isv2,isflux, 
 
 def plusweights(weight, module, bias = None):
     with torch.no_grad():
-        if weight.dtype == torch.float8_e4m3fn or weight.dtype == torch.float8_e5m2:  # Float8 の場合
+        if weight.dtype == torch.float8_e4m3fn or weight.dtype == torch.float8_e5m2:  # Float8
             orig_dtype = weight.dtype
-            weight = weight.to(torch.float32)  # Float32 に変換
+            weight = weight.to(torch.float32)  # Convert to Float32.
         else:
             orig_dtype = None
         updown = module.calc_updown(weight.to(dtype=torch.float32))
@@ -1279,8 +1358,9 @@ def dimalpha(lora_sd, base_dims={}, base_alphas={}):
 
 
 def fullpathfromname(name):
-    if hash == "" or hash ==[]: return ""
-    checkpoint_info = sd_models.get_closet_checkpoint_match(name)
+    checkpoint_info = resolve_checkpoint_info(name)
+    if checkpoint_info is None:
+        raise ValueError(f"Model not found: {name}")
     return checkpoint_info.filename
 
 def makeloraname(model_a,model_b):
@@ -1364,21 +1444,21 @@ def addnet_hash_legacy(b):
 
 def prepare_merge_metadata( ratio, blocks, fromLora ):
     """
-    メタデータに ratio, blocks などの情報を付加しておく
+    繝｡繧ｿ繝・・繧ｿ縺ｫ ratio, blocks 縺ｪ縺ｩ縺ｮ諠・ｱ繧剃ｻ伜刈縺励※縺翫￥
 
     Parameters
     ----
     ratio : string
-        name:ratio:blocks の ratio 部分
+        name:ratio:blocks 縺ｮ ratio 驛ｨ蛻・
     blocks : string
-        name:ratio:bloks の blocks 部分(ラベルではなくて実パラメータ)
+        name:ratio:bloks 縺ｮ blocks 驛ｨ蛻・繝ｩ繝吶Ν縺ｧ縺ｯ縺ｪ縺上※螳溘ヱ繝ｩ繝｡繝ｼ繧ｿ)
     fromLora : NetworkOnDisk
-        マージ対象のLoRA
+        繝槭・繧ｸ蟇ｾ雎｡縺ｮLoRA
     
     Returns
     ----
     dict[str, str]
-        メタデータ
+        繝｡繧ｿ繝・・繧ｿ
     """
     meta = fromLora.metadata
     meta["sshs_ratio"] = str.strip( ratio )
@@ -1405,34 +1485,34 @@ MINIMUM_METADATA = [
 
 def create_merge_metadata( sd, lmetas, lname, lprecision, metasets ):
     """
-    LoRAマージ後のメタデータを作成する
+    LoRA繝槭・繧ｸ蠕後・繝｡繧ｿ繝・・繧ｿ繧剃ｽ懈・縺吶ｋ
 
     Parameters
     ----
     sd : NetworkOnDisk
-        マージ後のLoRA
+        繝槭・繧ｸ蠕後・LoRA
     lmetas : dict[str, str]
-        マージされるLoRAのメタデータ
+        繝槭・繧ｸ縺輔ｌ繧記oRA縺ｮ繝｡繧ｿ繝・・繧ｿ
     lname : str
-        マージ後のLoRA名
+        繝槭・繧ｸ蠕後・LoRA蜷・
     lprecision : str
-        save precision の値
+        save precision 縺ｮ蛟､
     mergeAll : bool
-        メタデータの残し方。ただしタグ情報はディレクトリ名が後勝ちでマージします
-        True 全メタデータを残す。単マージの場合はTrue固定
-        False 一部のメタデータのみ残す
+        繝｡繧ｿ繝・・繧ｿ縺ｮ谿九＠譁ｹ縲ゅ◆縺縺励ち繧ｰ諠・ｱ縺ｯ繝・ぅ繝ｬ繧ｯ繝医Μ蜷阪′蠕悟享縺｡縺ｧ繝槭・繧ｸ縺励∪縺・
+        True 蜈ｨ繝｡繧ｿ繝・・繧ｿ繧呈ｮ九☆縲ょ腰繝槭・繧ｸ縺ｮ蝣ｴ蜷医・True蝗ｺ螳・
+        False 荳驛ｨ縺ｮ繝｡繧ｿ繝・・繧ｿ縺ｮ縺ｿ谿九☆
     
     Returns
     ----
     dict[str, str]
-        メタデータ
+        繝｡繧ｿ繝・・繧ｿ
     """
 
     metadata = {}
     networkModule = None
 
     if "first" in metasets:
-        # 単なるweightマージならそのままコピー
+        # 蜊倥↑繧仇eight繝槭・繧ｸ縺ｪ繧峨◎縺ｮ縺ｾ縺ｾ繧ｳ繝斐・
         metadata = lmetas[0]
     elif "new" in metasets:
         for key in MINIMUM_METADATA:
@@ -1440,18 +1520,18 @@ def create_merge_metadata( sd, lmetas, lname, lprecision, metasets ):
                 metadata[key] = lmetas[0][key]
         
     else:
-        # 複数マージの場合はマージしたタグと主要メタデータを保存
+        # 隍・焚繝槭・繧ｸ縺ｮ蝣ｴ蜷医・繝槭・繧ｸ縺励◆繧ｿ繧ｰ縺ｨ荳ｻ隕√Γ繧ｿ繝・・繧ｿ繧剃ｿ晏ｭ・
         metadata = lmetas[0]
         tags = {}
         for i, lmeta in enumerate( lmetas ):
             meta = {}
             metadata[ f"sshs_cp{i}" ] = json.dumps( lmeta )
 
-            # 最初の network_module を保持
+            # 譛蛻昴・ network_module 繧剃ｿ晄戟
             if networkModule is None and "ss_network_module" in lmeta:
                 networkModule = lmeta["ss_network_module"]
 
-            # タグをマージ
+            # 繧ｿ繧ｰ繧偵・繝ｼ繧ｸ
             if "merge" in metasets:
                 if "ss_tag_frequency" in lmeta:
                     ldict = lmeta["ss_tag_frequency"]
@@ -1462,11 +1542,11 @@ def create_merge_metadata( sd, lmetas, lname, lprecision, metasets ):
                                 if key not in mdict:
                                     mdict[key] = ldict[key]
 
-    # network_moduleからLoRA種別判定する場合が多いため、最初に見つけたものにする
+    # network_module縺九ｉLoRA遞ｮ蛻･蛻､螳壹☆繧句ｴ蜷医′螟壹＞縺溘ａ縲∵怙蛻昴↓隕九▽縺代◆繧ゅ・縺ｫ縺吶ｋ
     if networkModule is not None:
         metadata["ss_network_module"] = networkModule
 
-    # output名とprecision、dimは変更された可能性がある
+    # output蜷阪→precision縲‥im縺ｯ螟画峩縺輔ｌ縺溷庄閭ｽ諤ｧ縺後≠繧・
     if "without" not in metasets:
         metadata["ss_output_name"] = lname
     else:
@@ -1474,11 +1554,11 @@ def create_merge_metadata( sd, lmetas, lname, lprecision, metasets ):
             del metadata["ss_output_name"]
     metadata["ss_mixed_precision"] = lprecision
 
-    # metadataで保存できる形式に変換
+    # metadata縺ｧ菫晏ｭ倥〒縺阪ｋ蠖｢蠑上↓螟画鋤
     for key in metadata:
         if type(metadata[key] ) is not str:
             metadata[key] = json.dumps( metadata[key] )
-    # データ変更によりhashが変わるので計算
+    # 繝・・繧ｿ螟画峩縺ｫ繧医ｊhash縺悟､峨ｏ繧九・縺ｧ險育ｮ・
     model_hash, legacy_hash = precalculate_safetensors_hashes( sd, metadata )
     metadata[ "sshs_model_hash" ] = model_hash
     metadata[ "sshs_legacy_hash" ] = legacy_hash
@@ -1694,9 +1774,37 @@ def convert_diffusers_name_to_compvis(key, is_sd2):
 def lowvramdealer():
     try:
         from modules import lowvram
-        lowvram.module_in_gpu = None #web-uiのバグ対策
+        lowvram.module_in_gpu = None # Work around web UI low VRAM state issues.
     except:
         pass
+
+def resolve_checkpoint_info(name):
+    name = str(name or "").strip()
+    if not name:
+        return None
+
+    checkpoint_info = sd_models.get_closet_checkpoint_match(name)
+    if checkpoint_info is not None:
+        return checkpoint_info
+
+    normalized = name.replace("/", "\\")
+    normalized_no_hash = normalized.split(" [")[0]
+    for info in sd_models.checkpoints_list.values():
+        candidates = {
+            getattr(info, "name", ""),
+            getattr(info, "title", ""),
+            getattr(info, "short_title", ""),
+            getattr(info, "model_name", ""),
+            getattr(info, "name_for_extra", ""),
+        }
+        candidates.update(str(x) for x in getattr(info, "ids", []) if x)
+        for candidate in candidates:
+            c = str(candidate).replace("/", "\\")
+            c_no_hash = c.split(" [")[0]
+            if normalized in (c, c_no_hash) or normalized_no_hash in (c, c_no_hash):
+                return info
+
+    return None
 
 def get_flux_blocks(key):
     if "vae" in key:
@@ -1726,6 +1834,8 @@ def read_model_state_dict(checkpoint_info, device):
         return sd_models.read_state_dict(checkpoint_info.filename,map_location=device)
     
 def load_model(checkpoint_info, reload = False):
+    if checkpoint_info is None:
+        raise ValueError("Model not found: checkpoint_info is None")
     if forge:
         from modules.sd_models import forge_model_reload, model_data
         from modules_forge.main_entry import forge_unet_storage_dtype_options
@@ -1741,3 +1851,4 @@ def load_model(checkpoint_info, reload = False):
         forge_model_reload()
     else:
         sd_models.load_model(checkpoint_info)
+

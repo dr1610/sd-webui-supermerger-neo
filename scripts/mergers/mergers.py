@@ -1109,7 +1109,7 @@ def overwrite_last_weights(weights_a, weights_b):
 def saveekeys(keyratio,modelid):
     import csv
     path_root = scripts.basedir()
-    dir_path = os.path.join(path_root,"extensions","sd-webui-supermerger","scripts", "data")
+    dir_path = os.path.join(path_root,"extensions","sd-webui-supermerger-neo","scripts", "data")
 
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
@@ -1398,12 +1398,16 @@ def simggen(s_prompt,s_nprompt,s_steps,s_sampler,s_cfg,s_seed,s_w,s_h,s_batch_si
     global orig_reload_model_weights
 
     if forge or reforge:
-        orig_reload_model_weights = sd_models.reload_model_weights
-        sd_models.reload_model_weights = reload_model_weights
+        if hasattr(sd_models, "reload_model_weights"):
+            orig_reload_model_weights = sd_models.reload_model_weights
+            sd_models.reload_model_weights = reload_model_weights
 
-        processed:Processed = processing.process_images(p)
+            processed:Processed = processing.process_images(p)
 
-        sd_models.reload_model_weights = orig_reload_model_weights
+            sd_models.reload_model_weights = orig_reload_model_weights
+        else:
+            with patch.object(processing.sd_models, 'forge_model_reload', reload_model_weights), patch.object(processing, 'forge_model_reload', reload_model_weights):
+                processed: Processed = processing.process_images(p)
     elif neo:
         with patch.object(processing.sd_models, 'forge_model_reload', reload_model_weights), patch.object(processing, 'forge_model_reload', reload_model_weights):
             processed: Processed = processing.process_images(p)
