@@ -34,7 +34,7 @@ def is_installed(pip_package):
         return False
     
 requirements = [
-"diffusers==0.31.0",
+"diffusers==0.37.1",
 "scikit-learn",
 "accelerate"
 ]

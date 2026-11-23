@@ -5,7 +5,8 @@ import scripts.A1111.network as network
 from modules import devices
 from modules.ui import versions_html
 
-forge = "forge" in versions_html().lower()
+from modules import sd_models
+forge = hasattr(sd_models, "forge_model_reload") or "forge" in versions_html().lower()
 class QkvLinear(torch.nn.Linear):
     pass
 
@@ -40,7 +41,7 @@ class NetworkModuleLora(network.NetworkModule):
         if weight is None and none_ok:
             return None
         
-        is_linear = "Linear" in str(type(self.sd_module)) if forge else type(self.sd_module) in [torch.nn.Linear, torch.nn.modules.linear.NonDynamicallyQuantizableLinear, torch.nn.MultiheadAttention, QkvLinear]
+        is_linear = "Linear" in str(type(self.sd_module)) or "Embedding" in str(type(self.sd_module)) if forge else type(self.sd_module) in [torch.nn.Linear, torch.nn.modules.linear.NonDynamicallyQuantizableLinear, torch.nn.MultiheadAttention, QkvLinear, torch.nn.Embedding]
         is_conv = "Conv2d" in str(type(self.sd_module)) if forge else type(self.sd_module) in [torch.nn.Conv2d]
 
         if is_linear:
@@ -66,7 +67,7 @@ class NetworkModuleLora(network.NetworkModule):
                 weight = weight.reshape(module.weight.shape)
             module.weight.copy_(weight)
 
-        module.to(device=devices.cpu, dtype=devices.dtype)
+        module.to(device=devices.cpu, dtype=torch.float32)
         module.weight.requires_grad_(False)
 
         return module
@@ -93,5 +94,3 @@ class NetworkModuleLora(network.NetworkModule):
         self.down_model.to(device=devices.device)
 
         return y + self.up_model(self.down_model(x)) * self.multiplier() * self.calc_scale()
-
-

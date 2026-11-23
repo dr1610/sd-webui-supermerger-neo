@@ -105,13 +105,13 @@ def on_ui_tabs():
                         mclearcache= gr.Button(value="Clear Cache",elem_classes=["compact_button"],variant='primary')
 
                     with gr.Row(variant="compact"):
-                        model_a = gr.Dropdown(sd_models.checkpoint_tiles(),elem_id="model_converter_model_name",label="Model A",interactive=True)
+                        model_a = gr.Dropdown(sd_models.checkpoint_tiles(),elem_id="model_converter_model_name",label="Model A",interactive=True,allow_custom_value=True)
                         create_refresh_button(model_a, sd_models.list_models,lambda: {"choices": sd_models.checkpoint_tiles()},"refresh_checkpoint_Z")
 
-                        model_b = gr.Dropdown(sd_models.checkpoint_tiles(),elem_id="model_converter_model_name",label="Model B",interactive=True)
+                        model_b = gr.Dropdown(sd_models.checkpoint_tiles(),elem_id="model_converter_model_name",label="Model B",interactive=True,allow_custom_value=True)
                         create_refresh_button(model_b, sd_models.list_models,lambda: {"choices": sd_models.checkpoint_tiles()},"refresh_checkpoint_Z")
 
-                        model_c = gr.Dropdown(sd_models.checkpoint_tiles(),elem_id="model_converter_model_name",label="Model C",interactive=True)
+                        model_c = gr.Dropdown(sd_models.checkpoint_tiles(),elem_id="model_converter_model_name",label="Model C",interactive=True,allow_custom_value=True)
                         create_refresh_button(model_c, sd_models.list_models,lambda: {"choices": sd_models.checkpoint_tiles()},"refresh_checkpoint_Z")
 
                     mode = gr.Radio(label = "Merge Mode",choices = ["Weight sum", "Add difference", "Triple sum", "sum Twice"], value="Weight sum", info="A*(1-alpha)+B*alpha")
@@ -127,7 +127,7 @@ def on_ui_tabs():
 
                     with gr.Accordion("Options", open=False):
                         with gr.Row(variant="compact"):
-                            save_sets = gr.CheckboxGroup(["use cuda","save model", "overwrite","safetensors","fp16","save metadata","copy config","prune","Reset CLIP ids","use old calc method","debug"], value=["safetensors"], show_label=False, label="save settings")
+                            save_sets = gr.CheckboxGroup(["use cuda","save model", "overwrite","safetensors","fp16","save metadata","copy config","prune","Reset CLIP ids","use old calc method","debug"], value=["save model", "safetensors", "fp16"], show_label=False, label="save settings")
                         with gr.Row():
                             components.id_sets = gr.CheckboxGroup(["image", "PNG info"], label="save merged model ID to")
                             opt_value = gr.Slider(label="option(gamma) ", minimum=-1.0, maximum=20, step=0.1, value=0.3, interactive=True)
@@ -143,13 +143,6 @@ def on_ui_tabs():
 
                         with gr.Row(variant="compact"):
                             savecurrent = gr.Button(elem_id="savecurrent", elem_classes=["compact_button"], value="Save current merge(fp16 only)")
-
-                    with gr.Row():
-                        components.merge = gr.Button(elem_id="model_merger_merge", elem_classes=["compact_button"], value="Merge!",variant='primary')
-                        components.mergeandgen = gr.Button(elem_id="model_merger_merge", elem_classes=["compact_button"], value="Merge&Gen",variant='primary')
-                        components.gen = gr.Button(elem_id="model_merger_merge", elem_classes=["compact_button"], value="Gen",variant='primary')
-                        stopmerge = gr.Button(elem_id="stopmerge", elem_classes=["compact_button"], value="Stop")
-
 
                     with gr.Accordion("Merging Block Weights", open=False):
                         with gr.Row():
@@ -415,6 +408,7 @@ def on_ui_tabs():
                             unloadmodel = gr.Button(value="unload model",variant='primary')
 
                 with gr.Column(variant="compact",elem_id="txt2img_results"):
+                    components.merge_status = gr.Textbox(label="Merge status", value="Ready", interactive=False, lines=2)
                     components.currentmodel = gr.Textbox(label="Current Model",lines=1,value="")
                     components.submit_result = gr.Textbox(label="Message")
                     
@@ -426,10 +420,10 @@ def on_ui_tabs():
                     mhtmllog = output_panel[3]   if isinstance(output_panel, tuple) else output_panel.html_log
 
                     with gr.Row():
-                        components.merge2 = gr.Button(elem_id="model_merger_merge", elem_classes=["compact_button"], value="Merge!",variant='primary')
-                        components.mergeandgen2 = gr.Button(elem_id="model_merger_merge", elem_classes=["compact_button"], value="Merge&Gen",variant='primary')
-                        components.gen2 = gr.Button(elem_id="model_merger_merge", elem_classes=["compact_button"], value="Gen",variant='primary')
-                        stopmerge2 = gr.Button(elem_id="stopmerge", elem_classes=["compact_button"], value="Stop")
+                        components.merge = gr.Button(elem_id="supermerger_merge", elem_classes=["compact_button"], value="マージ実行", variant='primary')
+                        components.mergeandgen = gr.Button(elem_id="supermerger_merge_and_gen", elem_classes=["compact_button"], value="マージして画像生成", variant='primary')
+                        components.gen = gr.Button(elem_id="supermerger_gen", elem_classes=["compact_button"], value="画像生成のみ", variant='primary')
+                        stopmerge = gr.Button(elem_id="supermerger_stop", elem_classes=["compact_button"], value="停止")
                     
         # main ui end 
     
@@ -654,7 +648,7 @@ def on_ui_tabs():
             inputs =[*components.genparams,*components.hiresfix[1:],components.dtrue],
         )
 
-        resetcurrent.click(fn = lambda x : [gr.update(value = x) for x in RESETVALS] ,outputs =[*components.genparams,*components.hiresfix[1:]],)
+        resetcurrent.click(fn = lambda : [gr.update(value = x) for x in RESETVALS] ,outputs =[*components.genparams,*components.hiresfix[1:]],)
 
         s_reverse.click(fn = reversparams,
             inputs =mergeid,
@@ -674,7 +668,6 @@ def on_ui_tabs():
 
         stopgrid.click(fn=freezetime)
         stopmerge.click(fn=freezemtime)
-        stopmerge2.click(fn=freezemtime)
 
         checkpoints.change(fn=lambda x:",".join(x),inputs=[checkpoints],outputs=[inputer])
         blockids.change(fn=lambda x:" ".join(x),inputs=[blockids],outputs=[inputer])

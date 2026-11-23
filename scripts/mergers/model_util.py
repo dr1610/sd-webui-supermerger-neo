@@ -45,12 +45,12 @@ def to_half(sd):
 def savemodel(state_dict,currentmodel,fname,savesets,metadata={}):
     other_dict = {}
     if state_dict is None:
-        if shared.sd_model and shared.sd_model.sd_checkpoint_info:
-            metadata = shared.sd_model.sd_checkpoint_info.metadata.copy()
+        checkpoint_info = getattr(shared.sd_model, "sd_checkpoint_info", None) if shared.sd_model else None
+        if checkpoint_info:
+            metadata = (getattr(checkpoint_info, "metadata", None) or {}).copy()
         else:
             return "Current model is not a valid merged model"
 
-        checkpoint_info = shared.sd_model.sd_checkpoint_info
         # check if current merged model is a fake checkpoint_info
         if checkpoint_info is not None:
             filename = checkpoint_info.filename

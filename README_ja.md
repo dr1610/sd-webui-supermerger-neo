@@ -1,5 +1,13 @@
 # sd-webui-supermerger-neo
 
+## 2026-11-24: Neo用LoRA焼き込みの改善
+
+[cyberdeliaAI版](https://github.com/cyberdeliaAI/sd-webui-supermerger-forge-neo)の技術的修正を参考に、LoKr、Neo設定の互換性、Animaのキー対応、DoRA・正規化層の処理を改善しました。既存の進捗表示、検索UI、焼き込み後のモデル・キャッシュの後片付けは維持しています。
+
+焼き込みの強度は `LoRA名:強度` 欄で確認してください。`my_lora:-0.5` は、通常のLoRAではベースの重みから学習差分を50%引きます。マイナスは絵柄や概念が必ず正反対になる意味ではありません。全体強度と階層比率は掛け算します。スライダーを変えた後は「選択LoRAへ強度を反映」で欄を更新できます。
+
+強度は完成した差分とバイアスに一度だけ掛けます。LoRAの内部重みを直接変更せず、連続焼き込みで前回の強度を持ち越さないようにしました。計算はfp32で行い、形状不一致・非有限値・保存dtypeへの変換時のオーバーフローを検出します。独立したLoRAファイル同士のマージ方式は今回の変更対象外です。
+
 [hako-mikan/sd-webui-supermerger](https://github.com/hako-mikan/sd-webui-supermerger) を Stable Diffusion WebUI Forge - Neo 向けに調整した派生版です。
 
 元リポジトリの AGPL-3.0 ライセンスと hako-mikan 様の著作権表記を維持しています。
@@ -386,3 +394,9 @@ ASimilalityモード以外のモードで各階層の比率を計算する方法
 
 ## 謝辞
 このスクリプトは[kohya](https://github.com/kohya-ss)氏,[bbc-mc](https://github.com/bbc-mc)氏のスクリプト一部使用しています。また、拡張の開発に貢献した全ての方々にも感謝します。
+
+## バックエンドの回帰テスト
+
+PyTorch、safetensors、einopsがある環境で `python -B -m unittest discover -s tests -v` を実行できます。28件のオフラインテストで、符号付き強度、キャッシュ・終了処理、階層比率、Neo設定互換性、マージ進捗を確認します。Forge本体のサービスは代替し、アダプターの計算クラスとsafetensors入出力には実装本体を使います。画像の見た目やすべてのWebUI版の動作を保証するテストではありません。
+
+今回の公開には、既存ローカル版のマージ進捗表示と保存後の再読み込み修正も含みます。diffusersの固定バージョンは、検証したForge Neo環境と同じ `0.37.1` です。

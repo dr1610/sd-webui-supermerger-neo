@@ -1,5 +1,20 @@
 # sd-webui-supermerger-neo
 
+## 2026-11-24: reviewed Forge Neo baking update
+
+Adapted backend fixes from [cyberdeliaAI/sd-webui-supermerger-forge-neo](https://github.com/cyberdeliaAI/sd-webui-supermerger-forge-neo), commit `2913e57b38b37bbbadd7571dd99e115455cbaaff`, preserving the original AGPL-3.0 attribution and this fork's local UI and bake lifecycle fixes.
+
+- Apply signed strength to the completed adapter delta (including bias), without modifying its factors. Clear the baker's adapter caches for each run.
+- Correct factorized LoKr baking, fp32 adapter calculations, Neo option defaults, DoRA normalization, and normalization layers without bias.
+- Add Anima checkpoint/module aliases and 29-value baking weights; retain the current checkpoint-merger implementation.
+- Parse prompt-form LoRA entries and multiply the global strength by inline block weights. Reject invalid block names and nonfinite values.
+- Validate tensor shapes and finite results before saving, including output-dtype overflow. Correct fused/partial QKV handling.
+- Add an explicit button to copy the default multiplier into selected LoRA entries. The `name:strength` textbox is authoritative.
+
+For ordinary additive LoRA baking, `name:-0.5` means `W_out = W_base - 0.5 * delta_LoRA`. It subtracts the learned weight delta; it does not guarantee a visual opposite or remove a concept. Low-precision saving can round very small changes away. This update does not change the separate LoRA-to-LoRA merge algorithms.
+
+Validation uses the production adapter classes, real safetensors round trips, signed strengths, repeated bakes, factorized LoKr, LoHa, DoRA, norm bias, inpainting, fused QKV, Anima aliases, and invalid/overflowing tensors. Image appearance is not inferred from these numerical tests.
+
 Neo-compatible fork/adaptation of [hako-mikan/sd-webui-supermerger](https://github.com/hako-mikan/sd-webui-supermerger).
 
 This repository keeps the original AGPL-3.0 license and copyright notice from hako-mikan's SuperMerger.
@@ -385,3 +400,9 @@ You can obtain a list of the Elements contained in the model, the assignment of 
 ## Acknowledgements
 
 This script uses several scripts by [kohya](https://github.com/kohya-ss) and [bbc-mc](https://github.com/bbc-mc). I would also like to thank everyone who contributed to the development of the extensions.
+
+## Backend regression tests
+
+Run `python -B -m unittest discover -s tests -v` with PyTorch, safetensors and einops installed. These 28 offline tests cover signed baking, adapter caches and cleanup, block strengths, Neo option compatibility, and merge progress. Forge host services are stubbed; adapter classes and safetensors I/O use the production implementation. They do not certify image appearance or every WebUI version.
+
+The published update also includes the existing local Neo merge progress and checkpoint-reload fixes. Its diffusers pin matches the tested Forge Neo environment (`0.37.1`).

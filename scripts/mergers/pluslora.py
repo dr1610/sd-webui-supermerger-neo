@@ -21,10 +21,11 @@ from safetensors.torch import load_file, save_file
 from scripts.kohyas import extract_lora_from_models as ext
 from scripts.A1111 import networks as nets
 from scripts.mergers.model_util import filenamecutter, savemodel
+from scripts.mergers.bake_lifecycle import protect_bake
 from scripts.mergers.mergers import extract_super, unload_forge, q_dequantize, q_quantize, qdtyper, prefixer, BLOCKIDFLUX
 from tqdm import tqdm
 
-forge = launch_utils.git_tag()[0:2] == "f2" or launch_utils.git_tag() == "neo"
+forge = hasattr(sd_models, "forge_model_reload") or launch_utils.git_tag()[0:2] == "f2" or launch_utils.git_tag() == "neo"
 
 selectable = []
 pchanged = False
@@ -37,6 +38,20 @@ def lora_matches_query(name, lora_on_disk, query):
     filename = getattr(lora_on_disk, "filename", "") if lora_on_disk is not None else ""
     haystack = f"{name} {filename}".lower().replace("\\", "/")
     return all(term in haystack for term in terms)
+
+def normalize_lora_choice(name):
+    name = str(name or "")
+    return name[:name.find("[")] if "[" in name else name
+
+
+def selected_loras_to_loranames(selected, ratio):
+    selected = selected or []
+    out = []
+    for item in selected:
+        name = normalize_lora_choice(item).strip()
+        if name:
+            out.append(f"{name}:{ratio}")
+    return ",".join(out)
 
 def limited_lora_choices(lora_module, query=""):
     matches = []
@@ -58,11 +73,35 @@ BLOCKID26=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08"
 BLOCKID17=["BASE","IN01","IN02","IN04","IN05","IN07","IN08","M00","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08","OUT09","OUT10","OUT11"]
 BLOCKID12=["BASE","IN04","IN05","IN07","IN08","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05"]
 BLOCKID20=["BASE","IN00","IN01","IN02","IN03","IN04","IN05","IN06","IN07","IN08","M00","OUT00","OUT01","OUT02","OUT03","OUT04","OUT05","OUT06","OUT07","OUT08"]
-BLOCKNUMS = [12,17,20,26,61]
-BLOCKIDS=[BLOCKID12,BLOCKID17,BLOCKID20,BLOCKID26]
+BLOCKIDANIMA=["BASE"] + [f"B{x:02d}" for x in range(28)]
+BLOCKNUMS = [12,17,20,26,29,61]
+BLOCKIDS=[BLOCKID12,BLOCKID17,BLOCKID20,BLOCKID26,BLOCKIDANIMA]
+ANIMA_KEY_MARKERS = (
+    "lora_unet_blocks_",
+    "lora_unet_patch_embed",
+    "lora_unet_final_layer",
+    "lora_unet_t_embedder",
+    "lora_te_text_encoders_",
+    "lora_te_llm_adapter_",
+)
+ANIMA_QWEN_PREFIXES = (
+    "text_encoders_qwen25_7b_",
+    "text_encoders_qwen3_06b_transformer_",
+    "text_encoders_qwen3_transformer_",
+)
+ANIMA_QWEN_ALIAS_TO_DOT = {
+    "text_encoders_qwen25_7b_": "text_encoders.qwen25_7b.",
+    "text_encoders_qwen3_06b_transformer_": "text_encoders.qwen3_06b.transformer.",
+    "text_encoders_qwen3_transformer_": "text_encoders.qwen3.transformer.",
+}
+ANIMA_QWEN_MODEL_LAYER_PREFIXES = (
+    ("text_encoders_qwen25_7b_model_layers_", "text_encoders.qwen25_7b.model.layers."),
+    ("text_encoders_qwen3_06b_transformer_model_layers_", "text_encoders.qwen3_06b.transformer.model.layers."),
+    ("text_encoders_qwen3_transformer_model_layers_", "text_encoders.qwen3.transformer.model.layers."),
+)
 
 def to26(ratios):
-    if len(ratios) == 26 or len(ratios) > 40 : return ratios
+    if len(ratios) in (26, 29) or len(ratios) > 40 : return ratios
     ids = BLOCKIDS[BLOCKNUMS.index(len(ratios))]
     output = [0]*26
     for i, id in enumerate(ids):
@@ -77,6 +116,425 @@ def to61s(ratioss):
         else:
             out.append(ratios + [ratios[0]] * (61 - len(ratios)))
     return out
+
+
+def default_ratio_for_length(length, value):
+    return [float(value)] * length
+
+def detect_ratio_length_from_text(text):
+    count = text.count(",") + 1
+    if count in BLOCKNUMS:
+        return count
+    return 26
+
+def default_ratio_length_for_lora(filename):
+    try:
+        header = load_state_header(filename, torch.float)
+        if any(is_anima_lora_key(key) for key in header.keys()):
+            return 29
+    except Exception:
+        pass
+    return 26
+
+def split_lora_entries(text):
+    entries = []
+    current = []
+    angle_depth = 0
+    for char in text:
+        if char == "<":
+            angle_depth += 1
+        elif char == ">" and angle_depth > 0:
+            angle_depth -= 1
+        if char == "," and angle_depth == 0:
+            entry = "".join(current).strip()
+            if entry:
+                entries.append(entry)
+            current = []
+        else:
+            current.append(char)
+    entry = "".join(current).strip()
+    if entry:
+        entries.append(entry)
+    return entries
+
+def parse_lora_prompt_entry(entry):
+    entry = entry.strip()
+    if not (entry.startswith("<") and entry.endswith(">")):
+        return None
+
+    content = entry[1:-1].strip()
+    parts = [part.strip() for part in content.split(":")]
+    if len(parts) < 2 or parts[0].lower() not in ("lora", "lyco"):
+        return None
+
+    name = parts[1]
+    multiplier = parts[2] if len(parts) > 2 and parts[2] else "1"
+    lbw_value = None
+    for part in parts[3:]:
+        if part.startswith("lbw="):
+            lbw_value = part.replace("lbw=", "", 1)
+            break
+    return name, multiplier, lbw_value
+
+def parse_lora_merge_entries(text):
+    parsed = []
+    for entry in split_lora_entries(text):
+        prompt_entry = parse_lora_prompt_entry(entry)
+        if prompt_entry is not None:
+            name, multiplier, lbw_value = prompt_entry
+            parsed.append([name, multiplier, lbw_value] if lbw_value else [name, multiplier])
+            continue
+
+        if ":" in entry:
+            parsed.append([part.strip() for part in entry.split(":")])
+        elif parsed:
+            parsed[-1].append(entry.strip())
+        elif entry:
+            parsed.append([entry.strip(), "1"])
+    return parsed
+
+def ratio_at(ratios, index):
+    if index < len(ratios):
+        return ratios[index]
+    return ratios[0] if len(ratios) > 0 else 1.0
+
+def is_anima_lora_key(key):
+    return any(marker in key for marker in ANIMA_KEY_MARKERS)
+
+def is_lycoris_state_dict(state_dict):
+    lyco_suffixes = (
+        ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b", ".hada_t1", ".hada_t2",
+        ".lokr_w1", ".lokr_w1_a", ".lokr_w1_b", ".lokr_w2", ".lokr_w2_a", ".lokr_w2_b", ".lokr_t2",
+        ".oft_blocks", ".oft_diag", ".w_norm", ".b_norm",
+    )
+    return any(key.endswith(lyco_suffixes) for key in state_dict.keys())
+
+def is_anima_checkpoint_key(key):
+    return (
+        key.startswith("model.diffusion_model.blocks.")
+        or key.startswith("model.diffusion_model.patch_embed.")
+        or key.startswith("model.diffusion_model.final_layer.")
+        or key.startswith("model.diffusion_model.t_embedder.")
+        or key.startswith("net.blocks.")
+        or key.startswith("net.patch_embed.")
+        or key.startswith("net.final_layer.")
+        or key.startswith("net.t_embedder.")
+        or key.startswith("net.llm_adapter.")
+        or key.startswith("text_encoders.")
+        or key.startswith("llm_adapter.")
+        or ".model.layers." in key
+        or "_model_layers_" in key
+        or key.startswith("model.layers.")
+        or key.startswith("model_layers_")
+    )
+
+def register_key_alias(keychanger, alias, original_key):
+    if not alias:
+        return
+    existing = keychanger.get(alias)
+    if existing is None:
+        keychanger[alias] = original_key
+        return
+    # Prefer weight tensors when multiple checkpoint tensors share the same alias.
+    if existing.endswith(".bias") and original_key.endswith(".weight"):
+        keychanger[alias] = original_key
+
+def suffix_after_prefix(value, prefix):
+    if value.startswith(prefix):
+        return value[len(prefix):]
+    return None
+
+def strip_tensor_suffix(key):
+    for suffix in (".weight", ".bias", ".alpha", "_weight", "_bias", "_alpha"):
+        if key.endswith(suffix):
+            return key[:-len(suffix)]
+    return key
+
+def anima_mlp_alias_variants(value):
+    variants = {value}
+    replacements = (
+        (".mlp.0.", ".mlp.layer1."),
+        (".mlp.2.", ".mlp.layer2."),
+        ("_mlp_0_", "_mlp_layer1_"),
+        ("_mlp_2_", "_mlp_layer2_"),
+    )
+    changed = True
+    while changed:
+        changed = False
+        current = list(variants)
+        for item in current:
+            for source, target in replacements:
+                # Module names also end directly in mlp.0 / mlp.layer1.
+                if item.endswith(source[:-1]):
+                    variant = item[:-len(source[:-1])] + target[:-1]
+                    if variant not in variants:
+                        variants.add(variant)
+                        changed = True
+                if item.endswith(target[:-1]):
+                    variant = item[:-len(target[:-1])] + source[:-1]
+                    if variant not in variants:
+                        variants.add(variant)
+                        changed = True
+                if source in item and item.replace(source, target) not in variants:
+                    variants.add(item.replace(source, target))
+                    changed = True
+                if target in item and item.replace(target, source) not in variants:
+                    variants.add(item.replace(target, source))
+                    changed = True
+    return variants
+
+def _anima_join_tokens(tokens):
+    parts = []
+    i = 0
+    while i < len(tokens):
+        if i + 3 < len(tokens) and tokens[i] == "adaln" and tokens[i + 1] == "modulation" and tokens[i + 2] in {"cross", "self"} and tokens[i + 3] == "attn":
+            parts.append(f"adaln_modulation_{tokens[i + 2]}_attn")
+            i += 4
+            continue
+        if i + 2 < len(tokens) and tokens[i] == "adaln" and tokens[i + 1] == "modulation":
+            parts.append(f"adaln_modulation_{tokens[i + 2]}")
+            i += 3
+            continue
+        if i + 1 < len(tokens) and tokens[i] in {"cross", "self"} and tokens[i + 1] == "attn":
+            parts.append(f"{tokens[i]}_attn")
+            i += 2
+            continue
+        if i + 1 < len(tokens) and tokens[i] in {"q", "k"} and tokens[i + 1] == "norm":
+            parts.append(f"{tokens[i]}_norm")
+            i += 2
+            continue
+        if i + 1 < len(tokens) and tokens[i] in {"q", "k", "v", "output"} and tokens[i + 1] == "proj":
+            parts.append(f"{tokens[i]}_proj")
+            i += 2
+            continue
+        parts.append(tokens[i])
+        i += 1
+    return parts
+
+def anima_dot_name_from_alias(alias):
+    prefixes = ("model_diffusion_model_", "diffusion_model_", "net_")
+    for prefix in prefixes:
+        if alias.startswith(prefix):
+            suffix = alias[len(prefix):]
+            tokens = _anima_join_tokens(suffix.split("_"))
+            return prefix.rstrip("_") + "." + ".".join(tokens)
+    if alias.startswith("llm_adapter_"):
+        suffix = alias[len("llm_adapter_"):]
+        tokens = _anima_join_tokens(suffix.split("_"))
+        return "llm_adapter." + ".".join(tokens)
+    if alias.startswith("text_encoders_"):
+        suffix = alias[len("text_encoders_"):]
+        tokens = _anima_join_tokens(suffix.split("_"))
+        return "text_encoders." + ".".join(tokens)
+    for prefix, dot_prefix in ANIMA_QWEN_ALIAS_TO_DOT.items():
+        if alias.startswith(prefix):
+            suffix = alias[len(prefix):]
+            tokens = _anima_join_tokens(suffix.split("_"))
+            return dot_prefix + ".".join(tokens)
+    if alias.startswith("model_layers_"):
+        suffix = alias[len("model_layers_"):]
+        tokens = _anima_join_tokens(suffix.split("_"))
+        return "model.layers." + ".".join(tokens)
+    return None
+
+def anima_key_aliases_from_checkpoint_key(key):
+    aliases = set()
+    base_key = strip_tensor_suffix(key)
+    normalized = base_key.replace(".", "_")
+    aliases.add(base_key)
+    aliases.add(normalized)
+    aliases.update(anima_mlp_alias_variants(base_key))
+    aliases.update(anima_mlp_alias_variants(normalized))
+
+    if normalized.startswith("model_diffusion_model_"):
+        suffix = normalized.split("model_diffusion_model_", 1)[1]
+        aliases.add(suffix)
+        aliases.add(f"diffusion_model_{suffix}")
+        aliases.add(f"net_{suffix}")
+        model_dot = anima_dot_name_from_alias(normalized)
+        if model_dot:
+            aliases.add(model_dot)
+            model_suffix = suffix_after_prefix(model_dot, "model.diffusion_model.")
+            if model_suffix:
+                aliases.add(model_suffix)
+        suffix_dot = anima_dot_name_from_alias(f"diffusion_model_{suffix}")
+        if suffix_dot:
+            aliases.add(suffix_dot)
+        net_dot = anima_dot_name_from_alias(f"net_{suffix}")
+        if net_dot:
+            aliases.add(net_dot)
+
+    if normalized.startswith("net_"):
+        suffix = normalized.split("net_", 1)[1]
+        aliases.add(suffix)
+        aliases.add(f"diffusion_model_{suffix}")
+        aliases.add(f"model_diffusion_model_{suffix}")
+        net_dot = anima_dot_name_from_alias(normalized)
+        if net_dot:
+            aliases.add(net_dot)
+            net_suffix = suffix_after_prefix(net_dot, "net.")
+            if net_suffix:
+                aliases.add(net_suffix)
+        suffix_dot = anima_dot_name_from_alias(f"diffusion_model_{suffix}")
+        if suffix_dot:
+            aliases.add(suffix_dot)
+        model_dot = anima_dot_name_from_alias(f"model_diffusion_model_{suffix}")
+        if model_dot:
+            aliases.add(model_dot)
+
+    if normalized.startswith("text_encoders_"):
+        aliases.add(normalized)
+        aliases.add(normalized.split("text_encoders_", 1)[1])
+        text_dot = anima_dot_name_from_alias(normalized)
+        if text_dot:
+            aliases.add(text_dot)
+            text_suffix = suffix_after_prefix(text_dot, "text_encoders.")
+            if text_suffix:
+                aliases.add(text_suffix)
+        for prefix in ANIMA_QWEN_PREFIXES:
+            if normalized.startswith(prefix):
+                aliases.add(normalized.split(prefix, 1)[1])
+                aliases.add(normalized.replace(prefix, ""))
+                qwen_dot = anima_dot_name_from_alias(normalized)
+                if qwen_dot:
+                    aliases.add(qwen_dot)
+                    qwen_suffix = suffix_after_prefix(qwen_dot, "text_encoders.")
+                    if qwen_suffix:
+                        aliases.add(qwen_suffix)
+                    if ".model.layers." in qwen_dot:
+                        aliases.add("model.layers." + qwen_dot.split(".model.layers.", 1)[1])
+                        aliases.add("layers." + qwen_dot.split(".model.layers.", 1)[1])
+
+    if normalized.startswith("llm_adapter_"):
+        aliases.add(normalized)
+        llm_dot = anima_dot_name_from_alias(normalized)
+        if llm_dot:
+            aliases.add(llm_dot)
+
+    if normalized.startswith("model_layers_") or "_model_layers_" in normalized:
+        if normalized.startswith("model_layers_"):
+            model_layers_name = normalized
+        else:
+            model_layers_name = "model_layers_" + normalized.split("_model_layers_", 1)[1]
+        aliases.add(model_layers_name)
+        aliases.add(model_layers_name.split("model_", 1)[1])
+        aliases.add(f"layers_{model_layers_name.split('model_layers_', 1)[1]}")
+        model_dot = anima_dot_name_from_alias(model_layers_name)
+        if model_dot:
+            aliases.add(model_dot)
+            model_layers_suffix = suffix_after_prefix(model_dot, "model.layers.")
+            if model_layers_suffix:
+                aliases.add(model_layers_suffix)
+
+    return aliases
+
+def module_key_from_fullkey(fullkey):
+    return strip_tensor_suffix(fullkey)
+
+def candidate_checkpoint_module_keys(msd_key):
+    candidates = []
+
+    def add(value):
+        if value and value not in candidates:
+            candidates.append(value)
+
+    base = strip_tensor_suffix(msd_key)
+    add(base)
+
+    if "." in base:
+        add(base.replace(".", "_"))
+    if "_" in base:
+        dot_name = anima_dot_name_from_alias(base)
+        if dot_name:
+            add(dot_name)
+
+    if base.startswith("diffusion_model_"):
+        suffix = base[len("diffusion_model_"):]
+        add(f"model_diffusion_model_{suffix}")
+        add(f"net_{suffix}")
+        add(f"diffusion_model.{'.'.join(_anima_join_tokens(suffix.split('_')))}")
+        add(f"model.diffusion_model.{'.'.join(_anima_join_tokens(suffix.split('_')))}")
+        add(f"net.{'.'.join(_anima_join_tokens(suffix.split('_')))}")
+    elif base.startswith("diffusion_model."):
+        suffix = base[len("diffusion_model."):]
+        add(f"model.diffusion_model.{suffix}")
+        add(f"net.{suffix}")
+    elif base.startswith("model_diffusion_model_"):
+        suffix = base[len("model_diffusion_model_"):]
+        add(f"diffusion_model_{suffix}")
+        add(f"net_{suffix}")
+    elif base.startswith("model.diffusion_model."):
+        suffix = base[len("model.diffusion_model."):]
+        add(f"diffusion_model.{suffix}")
+        add(f"net.{suffix}")
+    elif base.startswith("net_"):
+        suffix = base[len("net_"):]
+        add(f"diffusion_model_{suffix}")
+        add(f"model_diffusion_model_{suffix}")
+        add(f"diffusion_model.{'.'.join(_anima_join_tokens(suffix.split('_')))}")
+        add(f"model.diffusion_model.{'.'.join(_anima_join_tokens(suffix.split('_')))}")
+    elif base.startswith("net."):
+        suffix = base[len("net."):]
+        add(f"diffusion_model.{suffix}")
+        add(f"model.diffusion_model.{suffix}")
+    elif base.startswith("layers_"):
+        suffix = base[len("layers_"):]
+        add(f"model_layers_{suffix}")
+        add(f"model.layers.{'.'.join(_anima_join_tokens(suffix.split('_')))}")
+        suffix_dot = ".".join(_anima_join_tokens(suffix.split('_')))
+        for underscored_prefix, dotted_prefix in ANIMA_QWEN_MODEL_LAYER_PREFIXES:
+            add(f"{underscored_prefix}{suffix}")
+            add(f"{dotted_prefix}{suffix_dot}")
+    elif base.startswith("model_layers_"):
+        suffix = base[len("model_layers_"):]
+        add(f"layers_{suffix}")
+        add(f"model.layers.{'.'.join(_anima_join_tokens(suffix.split('_')))}")
+        suffix_dot = ".".join(_anima_join_tokens(suffix.split('_')))
+        for underscored_prefix, dotted_prefix in ANIMA_QWEN_MODEL_LAYER_PREFIXES:
+            add(f"{underscored_prefix}{suffix}")
+            add(f"{dotted_prefix}{suffix_dot}")
+    elif base.startswith("model.layers."):
+        suffix = base[len("model.layers."):]
+        add(f"model_layers_{suffix.replace('.', '_')}")
+        add(f"layers_{suffix.replace('.', '_')}")
+        suffix_us = suffix.replace('.', '_')
+        for underscored_prefix, dotted_prefix in ANIMA_QWEN_MODEL_LAYER_PREFIXES:
+            add(f"{underscored_prefix}{suffix_us}")
+            add(f"{dotted_prefix}{suffix}")
+    elif any(base.startswith(underscored_prefix) for underscored_prefix, _ in ANIMA_QWEN_MODEL_LAYER_PREFIXES):
+        suffix = base.split("_model_layers_", 1)[1]
+        add(f"model_layers_{suffix}")
+        add(f"layers_{suffix}")
+        add(f"model.layers.{'.'.join(_anima_join_tokens(suffix.split('_')))}")
+    elif any(base.startswith(dotted_prefix) for _, dotted_prefix in ANIMA_QWEN_MODEL_LAYER_PREFIXES):
+        suffix = base.split(".model.layers.", 1)[1]
+        add(f"model_layers_{suffix.replace('.', '_')}")
+        add(f"layers_{suffix.replace('.', '_')}")
+        add(f"model.layers.{suffix}")
+    expanded = []
+    for candidate in candidates:
+        for variant in anima_mlp_alias_variants(candidate):
+            if variant not in expanded:
+                expanded.append(variant)
+    return expanded
+
+def resolve_checkpoint_weight_key(msd_key, keychanger, state_dict=None, expected_shape=None):
+    fallback = None
+    for candidate in candidate_checkpoint_module_keys(msd_key):
+        if candidate not in keychanger:
+            continue
+        resolved_key = keychanger[candidate]
+        if fallback is None:
+            fallback = (resolved_key, candidate)
+        if state_dict is not None and expected_shape is not None:
+            tensor = state_dict.get(resolved_key)
+            if tensor is not None and tuple(tensor.shape) == tuple(expected_shape):
+                return resolved_key, candidate
+        else:
+            return resolved_key, candidate
+    if fallback is not None:
+        return fallback
+    return None, msd_key
 
 def f_changediffusers(version):
     launch.run_pip(f"install diffusers=={version}", f"diffusers ver {version}")
@@ -156,6 +614,8 @@ def on_ui_tabs():
             sml_calcsets = gr.CheckboxGroup(choices=["Save as CSV","Load from CSV"],show_label=False)
             sml_update = gr.Button(elem_id="calcloras", value="update list",variant='primary')
             sml_lratio = gr.Slider(label="default LoRA multiplier", minimum=-1.0, maximum=2, step=0.1, value=1)
+            sml_apply_ratio = gr.Button(value="選択LoRAへ強度を反映")
+        gr.Markdown("焼き込みは **LoRAname:ratio 欄の値**を使います。例: `my_lora:-0.5` は差分を50%引きます。スライダー変更後は「選択LoRAへ強度を反映」を押してください。個別の強度や階層設定を入力済みの場合、その欄を直接編集できます。")
 
         with gr.Row():
             sml_selectall = gr.Button(elem_id="sml_selectall", value="select all",variant='primary')
@@ -172,8 +632,8 @@ def on_ui_tabs():
             sml_load_lbw_presets = gr.Button(value="load block weight presets")
             sml_clear_lbw_presets = gr.Button(value="clear block weight presets")
 
-        sml_selectall.click(fn = lambda x:gr.update(value = selectable),outputs = [sml_loras])
-        sml_deselectall.click(fn = lambda x:gr.update(value =[]),outputs = [sml_loras])
+        sml_selectall.click(fn = lambda:gr.update(value = selectable),outputs = [sml_loras])
+        sml_deselectall.click(fn = lambda:gr.update(value =[]),outputs = [sml_loras])
         sml_load_lbw_presets.click(fn=lambda: sml_lbwpresets, outputs=[sml_loraratios])
         sml_clear_lbw_presets.click(fn=lambda: "", outputs=[sml_loraratios])
 
@@ -190,13 +650,13 @@ def on_ui_tabs():
 
         sml_merge.click(
             fn=lmerge,
-            inputs=[sml_loranames,sml_loraratios,sml_settings,sml_filename,sml_dim,save_precision,calc_precision,sml_metasettings,alpha,beta,smooth,gr.Checkbox(value = True,visible = False),device],
+            inputs=[sml_loranames,sml_loras,sml_lratio,sml_loraratios,sml_settings,sml_filename,sml_dim,save_precision,calc_precision,sml_metasettings,alpha,beta,smooth,gr.Checkbox(value = True,visible = False),device],
             outputs=[sml_submit_result]
         )
 
         sml_extract.click(
             fn=lmerge,
-            inputs=[sml_loranames,sml_loraratios,sml_settings,sml_filename,sml_dim,save_precision,calc_precision,sml_metasettings,alpha,beta,smooth,gr.Checkbox(value = False,visible = False),device],
+            inputs=[sml_loranames,sml_loras,sml_lratio,sml_loraratios,sml_settings,sml_filename,sml_dim,save_precision,calc_precision,sml_metasettings,alpha,beta,smooth,gr.Checkbox(value = False,visible = False),device],
             outputs=[sml_submit_result]
         )
 
@@ -208,7 +668,7 @@ def on_ui_tabs():
 
         sml_cpmerge.click(
             fn=pluslora,
-            inputs=[sml_loranames,sml_loraratios,sml_settings,sml_filename,sml_model_a,save_precision,calc_precision,sml_metasettings,device],
+            inputs=[sml_loranames,sml_loras,sml_lratio,sml_loraratios,sml_settings,sml_filename,sml_model_a,save_precision,calc_precision,sml_metasettings,device],
             outputs=[sml_submit_result]
         )
 
@@ -236,6 +696,17 @@ def on_ui_tabs():
         def normalize_lora_choice(name):
             name = str(name or "")
             return name[:name.find("[")] if "[" in name else name
+
+        def selected_loras_to_loranames(selected, ratio):
+            selected = selected or []
+            out = []
+            for item in selected:
+                name = normalize_lora_choice(item).strip()
+                if name:
+                    out.append(f"{name}:{ratio}")
+            return ",".join(out)
+
+        sml_apply_ratio.click(fn=selected_loras_to_loranames, inputs=[sml_loras, sml_lratio], outputs=[sml_loranames])
 
         def updateloras(query="", selected=None):
             lora.list_available_loras()
@@ -444,14 +915,20 @@ def makelora(model_a,model_b,dim,saveto,settings,alpha,beta,save_precision,calc_
 ##############################################################
 ####### merge LoRAs
 
-def lmerge(loranames,loraratioss,settings,filename,dim,save_precision,calc_precision,metasets,alpha,beta,smooth,merge,device):
+def lmerge(loranames,selected_loras,default_ratio,loraratioss,settings,filename,dim,save_precision,calc_precision,metasets,alpha,beta,smooth,merge,device):
     try:
         import lora
-        loras_on_disk = [lora.available_loras.get(name, None) for name in loranames]
+        loranames = (loranames or "").strip()
+        if not loranames:
+            loranames = selected_loras_to_loranames(selected_loras, default_ratio)
+        if not loranames:
+            return "ERROR: No LoRA Selected"
+        parsed_lora_names = [x.split(":", 1)[0].strip() for x in loranames.split(",") if x.strip()]
+        loras_on_disk = [lora.available_loras.get(name, None) for name in parsed_lora_names]
         if any([x is None for x in loras_on_disk]):
             lora.list_available_loras()
 
-            loras_on_disk = [lora.available_loras.get(name, None) for name in loranames]
+            loras_on_disk = [lora.available_loras.get(name, None) for name in parsed_lora_names]
 
         lnames = loranames.split(",")
 
@@ -818,57 +1295,43 @@ def lycomerge(filename, ratios, calc_precision, device):
 
 ##############################################################
 ####### merge to checkpoint
-def pluslora(lnames,loraratios,settings,output,model,save_precision,calc_precision,metasets,device):
-    if model == []: return "ERROR: No model Selected"
+@protect_bake
+def pluslora(lnames,selected_loras,default_ratio,loraratios,settings,output,model,save_precision,calc_precision,metasets,device):
+    if not model: return "ERROR: No model Selected"
+    lnames = (lnames or "").strip()
+    if not lnames:
+        lnames = selected_loras_to_loranames(selected_loras, default_ratio)
     if lnames == "":return "ERROR: No LoRA Selected"
     import lora
     print("Plus LoRA start")
     add = ""
 
-    temp = []
-    for n in lnames.split(","):
-        if ":" in n:
-            temp.append(n.split(":"))
-        else:
-            temp[-1].append(n)
-    
-    lnames = temp
-
-    loraratios=loraratios.splitlines()
-    ldict ={}
-
-    for l in loraratios:
-        if ":" not in l or not any(l.count(",") == x - 1 for x in BLOCKNUMS) : continue
-        ldict[l.split(":")[0].strip()]=l.split(":")[1]
-
+    entries = parse_lora_merge_entries(lnames)
+    presets = {}
+    for line in (loraratios or "").splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            presets[key.strip()] = value.strip()
     names, filenames, lweis = [], [], []
-
-    for n in lnames:
-        if len(n) ==2:
-            ratio = [float(n[1])]*26
-        elif len(n) ==3:
-            if n[2].strip() in ldict:
-                ratio = [float(r)*float(n[1]) for r in ldict[n[2]].split(",")]
-                ratio = to26(ratio)
-            else:ratio = [float(n[1])]*26
-        elif len(n[2:]) in BLOCKNUMS:
-            ratio = [float(x) for x in n[2:]]
-            ratio = to26(ratio)
-        else:ratio = [float(n[1])]*26
- 
-        c_lora = lora.available_loras.get(n[0], lora.available_lora_aliases.get(n[0],None)) 
-        names.append(n[0])
-        filenames.append(c_lora.filename)
-        lweis.append(ratio)
+    for entry in entries:
+        name = entry[0]
+        item = lora.available_loras.get(name, lora.available_lora_aliases.get(name))
+        if item is None:
+            return f"ERROR: LoRA not found: {name}"
+        names.append(name)
+        filenames.append(item.filename)
+        lweis.append(resolve_bake_ratios(entry, presets, item.filename))
 
     modeln=filenamecutter(model,True)   
     dname = modeln
     for n in names:
       dname = dname + "+"+n
 
-    checkpoint_info = sd_models.get_closet_checkpoint_match(model)
+    checkpoint_info = resolve_checkpoint_info(model)
+    if checkpoint_info is None:
+        return f"ERROR: Model not found: {model}"
 
-    if forge:
+    if forge and hasattr(sd_models, "read_state_dict"):
         revert_target = sd_models.get_closet_checkpoint_match(shared.opts.sd_model_checkpoint)
     print(f"Loading {model}")
 
@@ -884,6 +1347,8 @@ def pluslora(lnames,loraratios,settings,output,model,save_precision,calc_precisi
     isv2 = "cond_stage_model.model.transformer.resblocks.0.attn.out_proj.weight" in theta_0.keys()
     isflux = any("double_block" in k for k in theta_0.keys())
     need_revert = prefixer(theta_0) if isflux else False
+
+    isanima = any(is_anima_checkpoint_key(k) for k in theta_0)
 
     if isflux:
         lweis = to61s(lweis)
@@ -906,6 +1371,11 @@ def pluslora(lnames,loraratios,settings,output,model,save_precision,calc_precisi
                 keychanger[skey.replace("text_encoders_","")] = key
             elif "model_" in skey:
                 keychanger[skey.split("model_",1)[1]] = key
+
+    if isanima:
+        for key in theta_0:
+            for alias in anima_key_aliases_from_checkpoint_key(key):
+                register_key_alias(keychanger, alias, key)
 
     lowvramdealer() # Work around web UI low VRAM state issues.
 
@@ -942,19 +1412,24 @@ def pluslora(lnames,loraratios,settings,output,model,save_precision,calc_precisi
         theta_0 = oldpluslora(theta_0,filenames,lweis,names, calc_precision,isxl,isv2, keychanger, device)
 
     #usemodelgen(theta_0,model)
+    validate_merged_checkpoint_state_dict(theta_0)
+    settings = list(settings or [])
     settings.append(save_precision)
     settings.append("safetensors")
     result = savemodel(theta_0,dname,output,settings)
 
-    if hasattr(lora, "loaded_loras"):
-        lora.loaded_loras.clear()
-    if hasattr(sd_models, "checkpoints_loaded"):
-        sd_models.checkpoints_loaded.clear()
-    if forge:
-        from modules.sd_models import FakeInitialModel
-        sd_models.unload_model_weights()
-        sd_models.checkpoint_info = FakeInitialModel()
-        load_model(revert_target, reload=True)
+    # Neo cleanup (including exceptions) is owned by protect_bake. Keep the
+    # original cache cleanup on non-Neo hosts.
+    if hasattr(sd_models, "read_state_dict"):
+        if hasattr(lora, "loaded_loras"):
+            lora.loaded_loras.clear()
+        if hasattr(sd_models, "checkpoints_loaded"):
+            sd_models.checkpoints_loaded.clear()
+        if forge:
+            from modules.sd_models import FakeInitialModel
+            sd_models.unload_model_weights()
+            sd_models.checkpoint_info = FakeInitialModel()
+            load_model(revert_target, reload=True)
 
     del theta_0
     gc.collect()
@@ -1018,22 +1493,34 @@ def oldpluslora(theta_0,filenames,lweis,names, calc_precision,isxl,isv2, keychan
     return theta_0
 
 def newpluslora(theta_0,filenames,lweis,names, calc_precision,isxl,isv2,isflux, keychanger):
+    # SuperMerger stores per-module LBW ratios on the loaded LoRA objects.
+    # Reusing cached objects can leak ratios across merge runs, so force reload.
+    if hasattr(nets, "loaded_networks"):
+        nets.loaded_networks.clear()
+    if hasattr(nets, "networks_in_memory"):
+        nets.networks_in_memory.clear()
     nets.load_networks(names, [1]* len(names),[1]* len(names), None, isxl, isv2)
 
-    for l, loaded in enumerate(nets.loaded_networks):
-        for n, name in enumerate(names):
-            changed = False
-            if name == loaded.name:
-                lbw(nets.loaded_networks[l],to26(lweis[n]),isv2,isflux)
-                changed = True
-            if not changed: "ERROR: {name}weight is not changed"
+    if len(nets.loaded_networks) != len(names):
+        raise RuntimeError("Some LoRAs failed to load; checkpoint was not saved")
+    if len(set(names)) != len(names):
+        raise ValueError("Use each LoRA once per bake; combine repeated strengths first")
+    for loaded, filename, weights, name in zip(nets.loaded_networks, filenames, lweis, names):
+        if loaded.name != name or not loaded.modules:
+            raise RuntimeError(f"No matching modules were loaded for LoRA: {name}")
+        lbw(loaded, to26(weights), isv2, isflux)
+        lora_sd, _, _ = load_state_dict(filename, torch.float32, "cpu")
+        sync_module_scales_from_state_dict(loaded, lora_sd)
+        del lora_sd
 
-    errormodules = []
     for net in nets.loaded_networks:
+        errormodules = []
         net.dyn_dim = None
+        applied_groups = set()
+        applied_count = 0
         for name,module in tqdm(net.modules.items(), desc=f"{net.name}"):
             fullkey = convert_diffusers_name_to_compvis(name,isv2)
-            msd_key = fullkey.split(".")[0]
+            msd_key = module_key_from_fullkey(fullkey)
 
             if isxl:
                 if "lora_unet" in msd_key:
@@ -1041,10 +1528,11 @@ def newpluslora(theta_0,filenames,lweis,names, calc_precision,isxl,isv2,isflux, 
                 elif "lora_te1_text_model" in msd_key:
                     msd_key = msd_key.replace("lora_te1_text_model", "0_transformer_text_model")
 
-            qvk = ["_q_proj","_k_proj","_v_proj","_out_proj"]
+            qvk = ["_q_proj","_k_proj","_v_proj","_out_proj",".q_proj",".k_proj",".v_proj",".out_proj",".output_proj"]
 
-            if msd_key in keychanger.keys():
-                wkey = keychanger[msd_key]
+            wkey, matched_key = resolve_checkpoint_weight_key(msd_key, keychanger, theta_0, module.shape)
+            if wkey is not None:
+                applied_count += 1
                 bkey = wkey.replace("weight","bias")
                 if bkey in theta_0.keys():
                     theta_0[wkey], theta_0[bkey]= plusweights(theta_0[wkey], module, bias = theta_0[bkey])
@@ -1052,74 +1540,68 @@ def newpluslora(theta_0,filenames,lweis,names, calc_precision,isxl,isv2,isflux, 
                     theta_0[wkey], _ = plusweights(theta_0[wkey] ,module)
 
             else:
-                if any(x in name for x in qvk):
-                    for x in qvk:
-                        if x in name:
-                            inkey,outkey = name.replace(x,"") + "_in_proj" ,name.replace(x,"") + "_out_proj"
-                    bkey = keychanger[outkey].replace("weight","bias")
-                    if bkey in theta_0.keys():
-                        theta_0[keychanger[inkey]] ,theta_0[keychanger[outkey]], theta_0[bkey]= plusweightsqvk(theta_0[keychanger[inkey]],theta_0[keychanger[outkey]], name ,module, net, bias = theta_0[bkey])
-                    else:
-                        theta_0[keychanger[inkey]] ,theta_0[keychanger[outkey]], _= plusweightsqvk(theta_0[keychanger[inkey]],theta_0[keychanger[outkey]], name ,module, net)
+                inkey, outkey = resolve_qkv_group_keys(name, keychanger)
+                group = re.sub(r"(?:_|\.)(?:q|k|v|out|output)_proj$", "", name)
+                if inkey is not None and inkey in keychanger and outkey in keychanger:
+                    if group in applied_groups:
+                        continue
+                    applied_groups.add(group)
+                    iw, ow = keychanger[inkey], keychanger[outkey]
+                    bkey = ow.replace("weight", "bias")
+                    theta_0[iw], theta_0[ow], result_bias = plusweightsqvk(
+                        theta_0[iw], theta_0[ow], group, module, net, theta_0.get(bkey))
+                    if bkey in theta_0:
+                        theta_0[bkey] = result_bias
+                    applied_count += 1
                 else:
                     errormodules.append(msd_key)
-                    
+
+        if not applied_count:
+            raise RuntimeError(f"No checkpoint weights matched LoRA: {net.name}")
         if errormodules != []:
             print(f"Unmerged modules in {net.name} : {errormodules}")
         gc.collect()
     return theta_0
 
-def plusweights(weight, module, bias = None):
+def plusweights(weight, module, bias=None):
     with torch.no_grad():
-        if weight.dtype == torch.float8_e4m3fn or weight.dtype == torch.float8_e5m2:  # Float8
-            orig_dtype = weight.dtype
-            weight = weight.to(torch.float32)  # Convert to Float32.
-        else:
-            orig_dtype = None
-        updown = module.calc_updown(weight.to(dtype=torch.float32))
-        if len(weight.shape) == 4 and weight.shape[1] == 9:
-            # inpainting model. zero pad updown to make channel[1]  4 to 9
-            updown = torch.nn.functional.pad(updown, (0, 0, 0, 0, 0, 5))
-        if type(updown) == tuple:
-            updown, ex_bias = updown
-            if ex_bias is not None and bias is not None:
-                bias += ex_bias
-        weight += updown.to(weight.dtype)
-    return weight if orig_dtype is None else weight.to(orig_dtype), bias
+        label = getattr(module, "network_key", "?")
+        # Zero must be a no-op even if an unused adapter contains invalid data.
+        if float(getattr(module, "lbw_ratio", 1.0)) == 0:
+            return weight, bias
+        delta, extra_bias = bake_delta(module, weight)
+        result = checked_bake_add(weight, delta, label)
+        result_bias = bias
+        if bias is not None and extra_bias is not None:
+            result_bias = checked_bake_add(bias, extra_bias, label + ".bias")
+        return result, result_bias
 
-def plusweightsqvk(inweight, outweight, network_layer_name, module ,net,bias = None):
+def plusweightsqvk(inweight, outweight, network_layer_name, module, net, bias=None):
     with torch.no_grad():
-        module_q = net.modules.get(network_layer_name + "_q_proj", None)
-        module_k = net.modules.get(network_layer_name + "_k_proj", None)
-        module_v = net.modules.get(network_layer_name + "_v_proj", None)
-        module_out = net.modules.get(network_layer_name + "_out_proj", None)
-
-        if module_q and module_k and module_v and module_out:
-            with torch.no_grad():
-                updown_q = module_q.calc_updown(inweight)
-                updown_k = module_k.calc_updown(inweight)
-                updown_v = module_v.calc_updown(inweight)
-                updown_qkv = torch.vstack([updown_q, updown_k, updown_v])
-                updown_out = module_out.calc_updown(outweight)
-                if type(updown_out) is tuple:
-                    updown_out,ex_bias = updown_out
-
-                inweight += updown_qkv
-                outweight += updown_out
-                if bias is not None and ex_bias is not None:
-                    bias += ex_bias
-
-    return inweight,outweight,bias
+        separator = "." if "." in network_layer_name else "_"
+        # One fused QKV matrix contains three independent weight slices.
+        weights = list(inweight.chunk(3, dim=0))
+        for i, projection in enumerate(("q", "k", "v")):
+            candidate = net.modules.get(network_layer_name + separator + projection + "_proj")
+            if candidate is not None:
+                weights[i], _ = plusweights(weights[i], candidate)
+        output = net.modules.get(network_layer_name + separator + "out_proj")
+        if output is None:
+            output = net.modules.get(network_layer_name + separator + "output_proj")
+        result_out, result_bias = outweight, bias
+        if output is not None:
+            result_out, result_bias = plusweights(outweight, output, bias)
+        return torch.cat(weights, dim=0), result_out, result_bias
 
 def lbw(lora,lwei,isv2,isflux=False):
     errormodules = []
 
-    blocks = LBLCOKS26
+    blocks = list(LBLCOKS26)
     if isv2:
         blocks[0] = V2ENCODER
 
     for key in lora.modules.keys():
-        ratio = 1
+        ratio = lwei[0]
         picked = False
 
         if isflux:
@@ -1129,6 +1611,33 @@ def lbw(lora,lwei,isv2,isflux=False):
                 picked = True
 
         else:
+            anima_block = re.search(r"(?:^|[._])blocks[._](\d+)(?:[._]|$)", key)
+            if anima_block:
+                block_index = int(anima_block.group(1))
+                ratio = lwei[min(block_index + 1, len(lwei) - 1)]
+                picked = True
+            else:
+                anima_layer = (
+                    re.search(r"^layers_(\d+)_", key)
+                    or re.search(r"_model_layers_(\d+)_", key)
+                    or re.search(r"\.model\.layers\.(\d+)\.", key)
+                )
+                if anima_layer:
+                    layer_index = int(anima_layer.group(1))
+                    ratio = lwei[min(layer_index + 1, len(lwei) - 1)]
+                    picked = True
+                elif key.startswith("layers_") or "model_layers_" in key or ".model.layers." in key:
+                    ratio = lwei[0]
+                    picked = True
+                elif any(marker in key for marker in (
+                    "diffusion_model.llm_adapter.norm",
+                    "diffusion_model_t_embedding_norm",
+                    "diffusion_model.t_embedding.norm",
+                    "llm_adapter.norm",
+                    "t_embedding_norm",
+                )):
+                    ratio = lwei[0]
+                    picked = True
             for i,block in enumerate(blocks):
                 if block in key:
                     if i == 26 or i == 27: i=0
@@ -1138,27 +1647,10 @@ def lbw(lora,lwei,isv2,isflux=False):
         if not picked:
             errormodules.append(key)
 
-        ltype = type(lora.modules[key]).__name__
-
-        set = False
-        if ltype in LORAANDSOON.keys():
-            setattr(lora.modules[key],LORAANDSOON[ltype],torch.nn.Parameter(getattr(lora.modules[key],LORAANDSOON[ltype]) * ratio))
-            #print(ltype)
-            set = True
-        else:
-            if hasattr(lora.modules[key],"up_model"):
-                lora.modules[key].up_model.weight= torch.nn.Parameter(lora.modules[key].up_model.weight *ratio)
-                #print("LoRA using LoCON")
-                set = True
-            else:
-                lora.modules[key].up.weight= torch.nn.Parameter(lora.modules[key].up.weight *ratio)
-                #print("LoRA")
-                set = True
-        if not set : 
-            print("unkwon LoRA")
+        lora.modules[key].lbw_ratio = ratio
 
     if errormodules:
-        print("unchanged modules in lbw:", errormodules)
+        print("BASE strength used for unmatched block names:", errormodules)
     else:
         print(f"{lora.name}: Successfully set the ratio {lwei} ")
 
@@ -1444,21 +1936,21 @@ def addnet_hash_legacy(b):
 
 def prepare_merge_metadata( ratio, blocks, fromLora ):
     """
-    繝｡繧ｿ繝・・繧ｿ縺ｫ ratio, blocks 縺ｪ縺ｩ縺ｮ諠・ｱ繧剃ｻ伜刈縺励※縺翫￥
+    郢晢ｽ｡郢ｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ邵ｺ・ｫ ratio, blocks 邵ｺ・ｪ邵ｺ・ｩ邵ｺ・ｮ隲繝ｻ・ｰ・ｱ郢ｧ蜑・ｽｻ莨懷・邵ｺ蜉ｱ窶ｻ邵ｺ鄙ｫ・･
 
     Parameters
     ----
     ratio : string
-        name:ratio:blocks 縺ｮ ratio 驛ｨ蛻・
+        name:ratio:blocks 邵ｺ・ｮ ratio 鬩幢ｽｨ陋ｻ繝ｻ
     blocks : string
-        name:ratio:bloks 縺ｮ blocks 驛ｨ蛻・繝ｩ繝吶Ν縺ｧ縺ｯ縺ｪ縺上※螳溘ヱ繝ｩ繝｡繝ｼ繧ｿ)
+        name:ratio:bloks 邵ｺ・ｮ blocks 鬩幢ｽｨ陋ｻ繝ｻ郢晢ｽｩ郢晏生ﾎ晉ｸｺ・ｧ邵ｺ・ｯ邵ｺ・ｪ邵ｺ荳岩ｻ陞ｳ貅倥Τ郢晢ｽｩ郢晢ｽ｡郢晢ｽｼ郢ｧ・ｿ)
     fromLora : NetworkOnDisk
-        繝槭・繧ｸ蟇ｾ雎｡縺ｮLoRA
+        郢晄ｧｭ繝ｻ郢ｧ・ｸ陝・ｽｾ髮趣ｽ｡邵ｺ・ｮLoRA
     
     Returns
     ----
     dict[str, str]
-        繝｡繧ｿ繝・・繧ｿ
+        郢晢ｽ｡郢ｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ
     """
     meta = fromLora.metadata
     meta["sshs_ratio"] = str.strip( ratio )
@@ -1485,34 +1977,34 @@ MINIMUM_METADATA = [
 
 def create_merge_metadata( sd, lmetas, lname, lprecision, metasets ):
     """
-    LoRA繝槭・繧ｸ蠕後・繝｡繧ｿ繝・・繧ｿ繧剃ｽ懈・縺吶ｋ
+    LoRA郢晄ｧｭ繝ｻ郢ｧ・ｸ陟募ｾ後・郢晢ｽ｡郢ｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ郢ｧ蜑・ｽｽ諛医・邵ｺ蜷ｶ・・
 
     Parameters
     ----
     sd : NetworkOnDisk
-        繝槭・繧ｸ蠕後・LoRA
+        郢晄ｧｭ繝ｻ郢ｧ・ｸ陟募ｾ後・LoRA
     lmetas : dict[str, str]
-        繝槭・繧ｸ縺輔ｌ繧記oRA縺ｮ繝｡繧ｿ繝・・繧ｿ
+        郢晄ｧｭ繝ｻ郢ｧ・ｸ邵ｺ霈費ｽ檎ｹｧ險椀RA邵ｺ・ｮ郢晢ｽ｡郢ｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ
     lname : str
-        繝槭・繧ｸ蠕後・LoRA蜷・
+        郢晄ｧｭ繝ｻ郢ｧ・ｸ陟募ｾ後・LoRA陷ｷ繝ｻ
     lprecision : str
-        save precision 縺ｮ蛟､
+        save precision 邵ｺ・ｮ陋滂ｽ､
     mergeAll : bool
-        繝｡繧ｿ繝・・繧ｿ縺ｮ谿九＠譁ｹ縲ゅ◆縺縺励ち繧ｰ諠・ｱ縺ｯ繝・ぅ繝ｬ繧ｯ繝医Μ蜷阪′蠕悟享縺｡縺ｧ繝槭・繧ｸ縺励∪縺・
-        True 蜈ｨ繝｡繧ｿ繝・・繧ｿ繧呈ｮ九☆縲ょ腰繝槭・繧ｸ縺ｮ蝣ｴ蜷医・True蝗ｺ螳・
-        False 荳驛ｨ縺ｮ繝｡繧ｿ繝・・繧ｿ縺ｮ縺ｿ谿九☆
+        郢晢ｽ｡郢ｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ邵ｺ・ｮ隹ｿ荵晢ｼ隴・ｽｹ邵ｲ繧・螺邵ｺ・ｰ邵ｺ蜉ｱ縺｡郢ｧ・ｰ隲繝ｻ・ｰ・ｱ邵ｺ・ｯ郢昴・縺・ｹ晢ｽｬ郢ｧ・ｯ郢晏現ﾎ懆惺髦ｪ窶ｲ陟墓ぁ莠ｫ邵ｺ・｡邵ｺ・ｧ郢晄ｧｭ繝ｻ郢ｧ・ｸ邵ｺ蜉ｱ竏ｪ邵ｺ繝ｻ
+        True 陷茨ｽｨ郢晢ｽ｡郢ｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ郢ｧ蜻茨ｽｮ荵昶・邵ｲ繧・・郢晄ｧｭ繝ｻ郢ｧ・ｸ邵ｺ・ｮ陜｣・ｴ陷ｷ蛹ｻ繝ｻTrue陜暦ｽｺ陞ｳ繝ｻ
+        False 闕ｳﾂ鬩幢ｽｨ邵ｺ・ｮ郢晢ｽ｡郢ｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ邵ｺ・ｮ邵ｺ・ｿ隹ｿ荵昶・
     
     Returns
     ----
     dict[str, str]
-        繝｡繧ｿ繝・・繧ｿ
+        郢晢ｽ｡郢ｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ
     """
 
     metadata = {}
     networkModule = None
 
     if "first" in metasets:
-        # 蜊倥↑繧仇eight繝槭・繧ｸ縺ｪ繧峨◎縺ｮ縺ｾ縺ｾ繧ｳ繝斐・
+        # 陷雁･竊醍ｹｧ莉㌃ight郢晄ｧｭ繝ｻ郢ｧ・ｸ邵ｺ・ｪ郢ｧ蟲ｨ笳守ｸｺ・ｮ邵ｺ・ｾ邵ｺ・ｾ郢ｧ・ｳ郢晄鱒繝ｻ
         metadata = lmetas[0]
     elif "new" in metasets:
         for key in MINIMUM_METADATA:
@@ -1520,18 +2012,18 @@ def create_merge_metadata( sd, lmetas, lname, lprecision, metasets ):
                 metadata[key] = lmetas[0][key]
         
     else:
-        # 隍・焚繝槭・繧ｸ縺ｮ蝣ｴ蜷医・繝槭・繧ｸ縺励◆繧ｿ繧ｰ縺ｨ荳ｻ隕√Γ繧ｿ繝・・繧ｿ繧剃ｿ晏ｭ・
+        # 髫阪・辟夂ｹ晄ｧｭ繝ｻ郢ｧ・ｸ邵ｺ・ｮ陜｣・ｴ陷ｷ蛹ｻ繝ｻ郢晄ｧｭ繝ｻ郢ｧ・ｸ邵ｺ蜉ｱ笳・ｹｧ・ｿ郢ｧ・ｰ邵ｺ・ｨ闕ｳ・ｻ髫補・ﾎ鍋ｹｧ・ｿ郢昴・繝ｻ郢ｧ・ｿ郢ｧ蜑・ｽｿ譎擾ｽｭ繝ｻ
         metadata = lmetas[0]
         tags = {}
         for i, lmeta in enumerate( lmetas ):
             meta = {}
             metadata[ f"sshs_cp{i}" ] = json.dumps( lmeta )
 
-            # 譛蛻昴・ network_module 繧剃ｿ晄戟
+            # 隴崢陋ｻ譏ｴ繝ｻ network_module 郢ｧ蜑・ｽｿ譎・亜
             if networkModule is None and "ss_network_module" in lmeta:
                 networkModule = lmeta["ss_network_module"]
 
-            # 繧ｿ繧ｰ繧偵・繝ｼ繧ｸ
+            # 郢ｧ・ｿ郢ｧ・ｰ郢ｧ蛛ｵ繝ｻ郢晢ｽｼ郢ｧ・ｸ
             if "merge" in metasets:
                 if "ss_tag_frequency" in lmeta:
                     ldict = lmeta["ss_tag_frequency"]
@@ -1542,11 +2034,11 @@ def create_merge_metadata( sd, lmetas, lname, lprecision, metasets ):
                                 if key not in mdict:
                                     mdict[key] = ldict[key]
 
-    # network_module縺九ｉLoRA遞ｮ蛻･蛻､螳壹☆繧句ｴ蜷医′螟壹＞縺溘ａ縲∵怙蛻昴↓隕九▽縺代◆繧ゅ・縺ｫ縺吶ｋ
+    # network_module邵ｺ荵晢ｽ鵜oRA驕橸ｽｮ陋ｻ・･陋ｻ・､陞ｳ螢ｹ笘・ｹｧ蜿･・ｰ・ｴ陷ｷ蛹ｻ窶ｲ陞溷｣ｹ・樒ｸｺ貅假ｽ∫ｸｲ竏ｵ諤呵崕譏ｴ竊馴囎荵昶命邵ｺ莉｣笳・ｹｧ繧・・邵ｺ・ｫ邵ｺ蜷ｶ・・
     if networkModule is not None:
         metadata["ss_network_module"] = networkModule
 
-    # output蜷阪→precision縲‥im縺ｯ螟画峩縺輔ｌ縺溷庄閭ｽ諤ｧ縺後≠繧・
+    # output陷ｷ髦ｪ竊恥recision邵ｲ窶･im邵ｺ・ｯ陞溽判蟲ｩ邵ｺ霈費ｽ檎ｸｺ貅ｷ蠎・妙・ｽ隲､・ｧ邵ｺ蠕娯旺郢ｧ繝ｻ
     if "without" not in metasets:
         metadata["ss_output_name"] = lname
     else:
@@ -1554,11 +2046,11 @@ def create_merge_metadata( sd, lmetas, lname, lprecision, metasets ):
             del metadata["ss_output_name"]
     metadata["ss_mixed_precision"] = lprecision
 
-    # metadata縺ｧ菫晏ｭ倥〒縺阪ｋ蠖｢蠑上↓螟画鋤
+    # metadata邵ｺ・ｧ闖ｫ譎擾ｽｭ蛟･縲堤ｸｺ髦ｪ・玖厄ｽ｢陟台ｸ岩・陞溽判驪､
     for key in metadata:
         if type(metadata[key] ) is not str:
             metadata[key] = json.dumps( metadata[key] )
-    # 繝・・繧ｿ螟画峩縺ｫ繧医ｊhash縺悟､峨ｏ繧九・縺ｧ險育ｮ・
+    # 郢昴・繝ｻ郢ｧ・ｿ陞溽判蟲ｩ邵ｺ・ｫ郢ｧ蛹ｻ・撹ash邵ｺ謔滂ｽ､蟲ｨ・冗ｹｧ荵昴・邵ｺ・ｧ髫ｪ閧ｲ・ｮ繝ｻ
     model_hash, legacy_hash = precalculate_safetensors_hashes( sd, metadata )
     metadata[ "sshs_model_hash" ] = model_hash
     metadata[ "sshs_legacy_hash" ] = legacy_hash
@@ -1826,7 +2318,7 @@ def get_flux_blocks(key):
     return "Not Merge"
 
 def read_model_state_dict(checkpoint_info, device):
-    if forge:
+    if forge or not hasattr(sd_models, "read_state_dict"):
         from backend.utils import load_torch_file
         load_model(checkpoint_info)
         return load_torch_file(checkpoint_info.filename,device=CUDA if "cuda" in device else CPU)
@@ -1852,3 +2344,124 @@ def load_model(checkpoint_info, reload = False):
     else:
         sd_models.load_model(checkpoint_info)
 
+
+
+
+
+def strip_network_weight_suffix(key):
+    for suffix in (
+        ".lora_down.weight",
+        ".lora_up.weight",
+        ".lora_mid.weight",
+        ".lora_A.weight",
+        ".lora_B.weight",
+        ".alpha",
+        ".scale",
+        ".bias",
+        ".dora_scale",
+        ".w_norm",
+        ".b_norm",
+        ".oft_blocks",
+        ".oft_diag",
+        ".rescale",
+    ):
+        if key.endswith(suffix):
+            return key[:-len(suffix)]
+    return key
+
+
+def sync_module_scales_from_state_dict(net, lora_sd):
+    synced = 0
+    for module in net.modules.values():
+        base_key = strip_network_weight_suffix(module.network_key)
+        down_key = None
+        for candidate in (
+            base_key + ".lora_down.weight",
+            base_key + ".lora_A.weight",
+        ):
+            if candidate in lora_sd:
+                down_key = candidate
+                break
+
+        alpha_key = next((candidate for candidate in (base_key + ".alpha", base_key + "_alpha") if candidate in lora_sd), None)
+        scale_key = next((candidate for candidate in (base_key + ".scale", base_key + "_scale") if candidate in lora_sd), None)
+
+        if down_key is not None:
+            module.dim = lora_sd[down_key].shape[0]
+        if alpha_key is not None:
+            module.alpha = float(lora_sd[alpha_key].detach().cpu().item())
+        if scale_key is not None:
+            module.scale = float(lora_sd[scale_key].detach().cpu().item())
+        synced += 1
+
+    print(f"{net.name}: synchronized alpha/dim metadata for {synced} modules")
+
+
+def resolve_qkv_group_keys(name, keychanger):
+    qkv_suffixes = ["_q_proj", "_k_proj", "_v_proj", "_out_proj", "_output_proj", ".q_proj", ".k_proj", ".v_proj", ".out_proj", ".output_proj"]
+    for suffix in qkv_suffixes:
+        if suffix in name:
+            base = name.rsplit(suffix, 1)[0]
+            if suffix.startswith("."):
+                inkey = base + ".in_proj"
+                out_candidates = [base + ".out_proj", base + ".output_proj"]
+            else:
+                inkey = base + "_in_proj"
+                out_candidates = [base + "_out_proj", base + "_output_proj"]
+            outkey = next((candidate for candidate in out_candidates if candidate in keychanger), out_candidates[0])
+            return inkey, outkey
+    return None, None
+
+
+def validate_tensor_is_finite(tensor, label):
+    if not torch.isfinite(tensor).all():
+        raise RuntimeError(f"Non-finite values detected while merging LoRA: {label}")
+
+
+def validate_merged_checkpoint_state_dict(state_dict):
+    checked = 0
+    for key, value in state_dict.items():
+        if not isinstance(value, torch.Tensor) or not torch.is_floating_point(value):
+            continue
+        validate_tensor_is_finite(value, key)
+        checked += 1
+    print(f"SuperMerger: validated {checked} floating tensors after LoRA merge")
+
+
+def resolve_bake_ratios(entry, presets, filename):
+    name, strength = entry[:2]
+    strength = float(strength)
+    if not math.isfinite(strength):
+        raise ValueError(f"LoRA strength must be finite: {name}")
+    if len(entry) == 2:
+        return default_ratio_for_length(default_ratio_length_for_lora(filename), strength)
+    spec = ",".join(entry[2:]).removeprefix("lbw=").strip()
+    spec = presets.get(spec, spec)
+    try:
+        blocks = [float(x) for x in spec.split(",")]
+    except ValueError:
+        raise ValueError(f"Unknown LoRA block preset: {spec}") from None
+    if len(blocks) not in BLOCKNUMS or not all(math.isfinite(x) for x in blocks):
+        raise ValueError("LoRA block weights must contain 12, 17, 20, 26, 29 or 61 finite values")
+    return to26([strength * x for x in blocks])
+
+
+def checked_bake_add(weight, delta, label):
+    """Compute before copying: catch fp16 output overflow as well as bad input."""
+    validate_tensor_is_finite(delta, label)
+    if tuple(weight.shape) != tuple(delta.shape):
+        raise RuntimeError(f"LoRA shape mismatch for {label}: {tuple(weight.shape)} vs {tuple(delta.shape)}")
+    result = (weight.float() + delta.float().to(weight.device)).to(weight.dtype)
+    validate_tensor_is_finite(result, label)
+    return result
+
+
+def bake_delta(module, weight):
+    ratio = float(getattr(module, "lbw_ratio", 1.0))
+    if not math.isfinite(ratio):
+        raise ValueError("LoRA strength must be finite")
+    result = module.calc_updown(weight.to(dtype=torch.float32))
+    delta, bias = result if isinstance(result, tuple) else (result, None)
+    if weight.ndim == 4 and weight.shape[1] == 9 and delta.shape[1] == 4:
+        delta = torch.nn.functional.pad(delta, (0, 0, 0, 0, 0, 5))
+    return delta * ratio, None if bias is None else bias * ratio

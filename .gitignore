@@ -134,3 +134,11 @@ dmypy.json
 *.bak*
 scripts/mbwpresets.txt
 xyzpresets.json
+
+# Merge history and machine-local backups
+mergehistory.csv
+loradims.csv
+*.codex-backup-*
+*.encoding-backup-*
+*.button-fix-backup-*
+tests/*-tests.json

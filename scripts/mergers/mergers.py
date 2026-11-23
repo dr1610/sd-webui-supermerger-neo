@@ -52,13 +52,13 @@ except:
 
 try:
     from modules import launch_utils
-    forge = launch_utils.git_tag()[0:2] == "f2"
+    forge = hasattr(sd_models, "forge_model_reload") or launch_utils.git_tag()[0:2] == "f2"
     reforge = launch_utils.git_tag()[0:2] == "f1" or launch_utils.git_tag() == "classic" 
-    neo = launch_utils.git_tag() == "neo"
+    neo = launch_utils.git_tag() == "neo" or (hasattr(sd_models, "forge_model_reload") and not hasattr(sd_models, "read_state_dict"))
 except:
     forge = reforge = neo = False
 
-if forge or neo:
+if forge or neo or not hasattr(sd_models, "read_state_dict"):
     from backend import memory_management
     from backend.utils import load_torch_file
 
@@ -111,6 +111,24 @@ NON4 = [None]*4
 
 informer = sd_models.get_closet_checkpoint_match
 
+def validate_merge_models(model_a, model_b, model_c, mode):
+    required = [("A", model_a), ("B", model_b)]
+    if not mode or MODES[0] not in mode:
+        required.append(("C", model_c))
+
+    if any(not name for _, name in required):
+        missing = ", ".join(label for label, name in required if not name)
+        return f"ERROR: Select Model {missing} before merging."
+
+    for label, name in required:
+        info = sd_models.get_closet_checkpoint_match(name)
+        if info is None or not os.path.isfile(info.filename):
+            sd_models.list_models()
+            info = sd_models.get_closet_checkpoint_match(name)
+        if info is None or not os.path.isfile(info.filename):
+            return f"ERROR: Model {label} is not available: {name}. Refresh the checkpoint list."
+    return None
+
 #msettings=[weights_a,weights_b,model_a,model_b,model_c,device,base_alpha,base_beta,mode,loranames,useblocks,custom_name,save_sets,id_sets,wpresets,deep]  
 
 def smergegen(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode,
@@ -119,7 +137,14 @@ def smergegen(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,m
                        genoptions,s_hrupscaler,s_hr2ndsteps,s_denois_str,s_hr_scale,
                        lmode,lsets,llimits_u,llimits_l,llimits_u_d,llimits_l_d,lseed,lserial,lcustom,lround,
                        currentmodel,imggen,
-                       *txt2imgparams):
+                       *txt2imgparams, status_callback=None):
+
+    report = status_callback or (lambda message: None)
+    report("Checking model selection...")
+    validation_error = validate_merge_models(model_a, model_b, model_c, mode)
+    if validation_error:
+        report(validation_error)
+        return (validation_error, "not loaded", *NON4) if imggen else (validation_error, "not loaded")
 
     lucks = {"on":False, "mode":lmode,"set":lsets,"upp":llimits_u,"low":llimits_l,"uppd":llimits_u_d,"lowd":llimits_l_d,"seed":lseed,"num":lserial,"cust":lcustom,"round":int(lround)}
     print(dsettings)
@@ -128,30 +153,52 @@ def smergegen(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,m
 
     result,currentmodel,modelid,theta_0,metadata = smerge(
                         weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode,calcmode,
-                        useblocks,custom_name,save_sets,id_sets,wpresets,deep,tensor,bake_in_vae,opt_value,inex,ex_blocks,ex_elems,dsettings,lucks
+                        useblocks,custom_name,save_sets,id_sets,wpresets,deep,tensor,bake_in_vae,opt_value,inex,ex_blocks,ex_elems,dsettings,lucks,
+                        status_callback=status_callback
                         )
 
-    if "ERROR" in result or "STOPPED" in result: 
+    if "ERROR" in result or "STOPPED" in result:
+        report(result)
         return result,"not loaded",*NON4
 
     checkpoint_info = sd_models.get_closet_checkpoint_match(model_a)
 
     save = True if SAVEMODES[0] in save_sets else False
 
+    report("Saving checkpoint..." if save else "Loading merged checkpoint...")
     result = savemodel(theta_0,currentmodel,custom_name,save_sets,metadata) if save else "Merged model loaded:"+currentmodel
 
-    model_loader(checkpoint_info, theta_0, metadata, currentmodel)
+    if neo and save:
+        prefix = "Merged model saved in "
+        if not result.startswith(prefix):
+            cachedealer(False)
+            return (result, "not loaded", *NON4) if imggen else (result, "not loaded")
+        # Neo's loader now takes a filename; use its maintained loading pipeline.
+        saved_info = sd_models.CheckpointInfo(result[len(prefix):])
+        saved_info.register()
+        shared.opts.data["sd_model_checkpoint"] = saved_info.title
+        from modules_forge.main_entry import refresh_model_loading_parameters
+        refresh_model_loading_parameters()
+        sd_models.model_data.forge_hash = None
+        del theta_0
+        theta_0 = None
+        devices.torch_gc()
+        report("Loading saved checkpoint for generation...")
+        sd_models.forge_model_reload()
+    else:
+        model_loader(checkpoint_info, theta_0, metadata, currentmodel)
 
     cachedealer(False)
 
     del theta_0
     devices.torch_gc()
+    report("Merge complete.")
 
     debug = "debug" in save_sets
 
     if ("copy config" in save_sets) and ("(" not in result):
         try:
-            extras.create_config(result.replace("Merged model saved in ",""), 0, informer(model_a), informer(model_b), informer(model_b))
+            extras.create_config(result.replace("Merged model saved in ",""), 0, informer(model_a), informer(model_b), informer(model_c))
         except:
             pass
 
@@ -221,7 +268,11 @@ statistics = {"sum":{},"mean":{},"max":{},"min":{}}
 ##### Main Merging Code
 
 def smerge(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode,calcmode,
-                useblocks,custom_name,save_sets,id_sets,wpresets,deep,fine,bake_in_vae,opt_value,inex,ex_blocks,ex_elems,esettings,lucks,main = [False,False,False]):
+                useblocks,custom_name,save_sets,id_sets,wpresets,deep,fine,bake_in_vae,opt_value,inex,ex_blocks,ex_elems,esettings,lucks,main = [False,False,False],status_callback=None):
+
+    validation_error = validate_merge_models(model_a, model_b, model_c, mode)
+    if validation_error:
+        return validation_error, *NON4
 
     caster("merge start",hearm)
     theta_0 = theta_1 = theta_2 = None
@@ -328,12 +379,14 @@ def smerge(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode
             base_beta = float(weights_b_t[0]) 
             weights_b = [float(w) for w in weights_b_t[1].split(',')]
             caster(f"from {weights_b_t}, beta = {base_beta},weights_a ={weights_b}",hearm)
-            if not(len(weights_b) == 25 or len(weights_b) == 19 or len(weights_a) == 60 or len(weights_a) == 109): return f"ERROR: weights beta value must be 20 or 26 or 61, or 110.",*NON4
+            if not(len(weights_b) == 25 or len(weights_b) == 19 or len(weights_b) == 60 or len(weights_b) == 109): return f"ERROR: weights beta value must be 20 or 26 or 61, or 110.",*NON4
 
     #model loading start 
     caster("Model loading start",hearm)
     printstart(model_a,model_b,model_c,base_alpha,base_beta,weights_a,weights_b,mode,useblocks,calcmode,deep,lucks['ceed'],fine,inex,ex_blocks,ex_elems,device)
 
+    if status_callback:
+        status_callback("Loading Model B...")
     theta_1 = load_model_weights_m(model_b,2,cachetarget,device).copy()
     qdtypes[1] = qdtyper(theta_1)
     prefixer(theta_1)
@@ -360,6 +413,8 @@ def smerge(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode
 
     if stopmerge: return "STOPPED", *NON4
     if not (MODES[0] in mode): #Add, Twice, Triple
+        if status_callback:
+            status_callback("Loading Model C...")
         theta_2 = load_model_weights_m(model_c,3,cachetarget,device).copy()
         prefixer(theta_2)
         qdtypes[2] = qdtyper(theta_2)
@@ -388,6 +443,8 @@ def smerge(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode
             theta_2 = None
             devices.torch_gc()
     
+    if status_callback:
+        status_callback("Loading Model A...")
     if  "tensor" in calcmode or "self" in calcmode:
         theta_t = load_model_weights_m(model_a,1,cachetarget,device).copy()
         theta_0 ={}
@@ -421,7 +478,11 @@ def smerge(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode
     keyratio = []
     key_and_alpha = {}
 
+    total_keys = len(theta_0)
+    progress_interval = max(total_keys // 20, 1)
     for num, key in enumerate(tqdm(theta_0.keys(), desc="Stage 1/2") if not False else theta_0.keys()):
+        if status_callback and num % progress_interval == 0:
+            status_callback(f"Merging tensors: {num}/{total_keys}")
         if debug:print(key)
         if stopmerge: return "STOPPED", *NON4
         if (isflux and key not in theta_1) or (not isflux and not ("model" in key and key in theta_1)):continue
@@ -469,14 +530,14 @@ def smerge(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode
                     current_beta = weights_b[weight_index - 1]
                     if len(weights_b) == 109:
                         if skip:weights_b_excluded[weight_index_xl] = 0
-                        current_alpha = weights_b[weight_index_xl - 1]
+                        current_beta = weights_b[weight_index_xl - 1]
             if weight_index == 0:
                 if len(weights_a) == 109 and weight_index_xl == 1:
                     if skip:weights_a_excluded[weight_index_xl] = 0
                     current_alpha = weights_a[weight_index_xl - 1] 
                 if len(weights_b) == 109 and usebeta and weight_index_xl == 1:
                     if skip:weights_b_excluded[weight_index_xl] = 0
-                    current_alpha = weights_b[weight_index_xl - 1]
+                    current_beta = weights_b[weight_index_xl - 1]
                 
                 if skip:weights_a_excluded[0] = 0
                 if skip:weights_b_excluded[0] = 0
@@ -512,14 +573,22 @@ def smerge(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode
 
             elif MODES[2] in mode:#Triple
                 caster(f"{num}, {block}, {model_a}+{1-current_alpha-current_beta}+{model_b}*{current_alpha}+ {model_c}*{current_beta}",hear)
-                #
+                # A checkpoint can contain individual float32 tensors even when
+                # its reported precision is fp16. torch.lerp requires matching
+                # dtypes for all three inputs, so promote mixed tensors before
+                # the calculation and restore Model A's dtype afterwards.
+                result_dtype = theta_0_a.dtype
+                work_dtype = (torch.float32 if use32 or
+                              theta_0_a.dtype != theta_1[key].dtype or
+                              theta_0_a.dtype != theta_2[key].dtype
+                              else result_dtype)
+                triple_a = theta_0_a.to(work_dtype)
+                triple_b = theta_1[key].to(work_dtype)
+                triple_c = theta_2[key].to(work_dtype)
                 if uselerp and current_alpha + current_beta != 0:
-                    if use32:
-                        theta_0_a =lerp(theta_0_a.to(torch.float32),lerp(theta_1[key].to(torch.float32),theta_2[key].to(torch.float32),current_beta/(current_alpha + current_beta)),current_alpha + current_beta).to(theta_0_a.dtype)
-                    else:
-                        theta_0_a =lerp(theta_0_a,lerp(theta_1[key],theta_2[key],current_beta/(current_alpha + current_beta)),current_alpha + current_beta)
+                    theta_0_a = lerp(triple_a, lerp(triple_b, triple_c, current_beta/(current_alpha + current_beta)), current_alpha + current_beta).to(result_dtype)
                 else:
-                    theta_0_a = (1 - current_alpha-current_beta) * theta_0_a + current_alpha * theta_1[key]+current_beta * theta_2[key] 
+                    theta_0_a = ((1 - current_alpha-current_beta) * triple_a + current_alpha * triple_b + current_beta * triple_c).to(result_dtype)
 
             elif MODES[3] in mode:#Twice
                 caster(f"{num}, {block}, {key},{model_a} +  {1-current_alpha} + {model_b}*{current_alpha}",hear)
@@ -622,6 +691,8 @@ def smerge(weights_a,weights_b,model_a,model_b,model_c,base_alpha,base_beta,mode
     if need_revert:
         prefixer(theta_0, True)
 
+    if status_callback:
+        status_callback("Finalizing merged tensors...")
     for key in tqdm(theta_1.keys(), desc="Stage 2/2"):
         if key in CHCKPOINT_DICT_SKIP_ON_MERGE or isflux:
             continue
@@ -976,7 +1047,7 @@ def elementals(key,weight_index,weight_index_xl,deep,randomer,num,lucks,deepprin
     return current_alpha
 
 def forkforker(filename,device):
-    if forge or neo:
+    if forge or neo or not hasattr(sd_models, "read_state_dict"):
         return load_torch_file(filename, device = torch.device(device))
     try:
         return sd_models.read_state_dict(filename, map_location = device)
@@ -1096,12 +1167,12 @@ def overwrite_last_weights(weights_a, weights_b):
     if len(reader) <= 1:
         raise ValueError("No data rows to update in mergehistory.csv.")
 
-    # 最後のデータ行に対して weights を上書き
+    # 譛蠕後・繝・・繧ｿ陦後↓蟇ｾ縺励※ weights 繧剃ｸ頑嶌縺・
     last_row_index = len(reader) - 1
     reader[last_row_index][3] = str(weights_a)  # "weights alpha"
     reader[last_row_index][4] = str(weights_b)  # "weights beta"
 
-    # 上書き保存
+    # 荳頑嶌縺堺ｿ晏ｭ・
     with open(filepath, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerows(reader)
@@ -1642,10 +1713,12 @@ def resetclip(theta):
 ################################################
 ##### cache
 def cachedealer(start):
+    # Neo removed this legacy option; assigning it fails in Options.__setattr__.
+    if "sd_checkpoint_cache" not in shared.opts.data_labels:
+        return
     if start:
         global orig_cache
-        if not neo:
-            orig_cache = shared.opts.sd_checkpoint_cache
+        orig_cache = shared.opts.sd_checkpoint_cache
         shared.opts.sd_checkpoint_cache = 0
     else:
         shared.opts.sd_checkpoint_cache = orig_cache
