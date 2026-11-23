@@ -397,6 +397,6 @@ ASimilalityモード以外のモードで各階層の比率を計算する方法
 
 ## バックエンドの回帰テスト
 
-PyTorch、safetensors、einopsがある環境で `python -B -m unittest discover -s tests -v` を実行できます。28件のオフラインテストで、符号付き強度、キャッシュ・終了処理、階層比率、Neo設定互換性、マージ進捗を確認します。Forge本体のサービスは代替し、アダプターの計算クラスとsafetensors入出力には実装本体を使います。画像の見た目やすべてのWebUI版の動作を保証するテストではありません。
+PyTorch、safetensors、einops、NumPyがある環境で `python -B -m unittest discover -s tests -v` を実行できます。28件のオフラインテストで、符号付き強度、キャッシュ・終了処理、階層比率、Neo設定互換性、マージ進捗を確認します。Forge本体のサービスは代替し、アダプターの計算クラスとsafetensors入出力には実装本体を使います。画像の見た目やすべてのWebUI版の動作を保証するテストではありません。
 
 今回の公開には、既存ローカル版のマージ進捗表示と保存後の再読み込み修正も含みます。diffusersの固定バージョンは、検証したForge Neo環境と同じ `0.37.1` です。

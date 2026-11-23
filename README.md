@@ -403,6 +403,6 @@ This script uses several scripts by [kohya](https://github.com/kohya-ss) and [bb
 
 ## Backend regression tests
 
-Run `python -B -m unittest discover -s tests -v` with PyTorch, safetensors and einops installed. These 28 offline tests cover signed baking, adapter caches and cleanup, block strengths, Neo option compatibility, and merge progress. Forge host services are stubbed; adapter classes and safetensors I/O use the production implementation. They do not certify image appearance or every WebUI version.
+Run `python -B -m unittest discover -s tests -v` with PyTorch, safetensors, einops and NumPy installed. These 28 offline tests cover signed baking, adapter caches and cleanup, block strengths, Neo option compatibility, and merge progress. Forge host services are stubbed; adapter classes and safetensors I/O use the production implementation. They do not certify image appearance or every WebUI version.
 
 The published update also includes the existing local Neo merge progress and checkpoint-reload fixes. Its diffusers pin matches the tested Forge Neo environment (`0.37.1`).
